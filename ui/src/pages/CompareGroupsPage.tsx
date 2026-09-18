@@ -11,16 +11,19 @@ import { LoadingState } from '@/components/shared/Spinner'
 import { JDenticon } from '@/components/shared/JDenticon'
 import { FacetPanel } from '@/components/shared/FacetPanel'
 import { CompareDimensionInsights } from '@/components/compare/CompareDimensionInsights'
-import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER } from '@/pages/RunDetailPage'
+import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER, getAggregatedStats } from '@/pages/RunDetailPage'
 import { type CompareRun, type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
 import { MetricsComparison } from '@/components/compare/MetricsComparison'
 import { MGasComparisonChart } from '@/components/compare/MGasComparisonChart'
+import { GroupHeatmap } from '@/components/compare/GroupHeatmap'
+import { type HeatmapColorMode } from '@/components/compare/heatmapColor'
+import { DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD } from '@/utils/perfThreshold'
 import { CVComparisonChart } from '@/components/compare/CVComparisonChart'
 import { PercentageDiffChart } from '@/components/compare/PercentageDiffChart'
 import { TestComparisonTable } from '@/components/compare/TestComparisonTable'
 import { ResourceComparisonCharts } from '@/components/compare/ResourceComparisonCharts'
 import { GroupBuilder } from '@/components/compare/GroupBuilder'
-import { type GroupDef, parseGroupsParam, encodeGroupsParam } from '@/components/compare/groupUtils'
+import { type GroupDef, parseGroupsParam, encodeGroupsParam, selectGroupRuns } from '@/components/compare/groupUtils'
 import { averageResults } from '@/utils/averageResults'
 import { TestDetailModal } from '@/components/compare/TestDetailModal'
 
@@ -47,6 +50,8 @@ export function CompareGroupsPage() {
     filterRegex?: string
     gasBuckets?: string
     diffFilter?: string
+    heatmapColor?: string
+    heatmapThreshold?: string
   }
 
   const suiteHash = search.suite ?? ''
@@ -55,7 +60,7 @@ export function CompareGroupsPage() {
   const aggMode = (search.agg === 'median' ? 'median' : 'avg') as 'avg' | 'median'
   const stepFilter = parseStepFilter(search.steps)
 
-  const { data: index } = useIndex()
+  const { data: index, isLoading: indexLoading } = useIndex()
   const { data: suite } = useSuite(suiteHash)
 
   const updateSearch = useCallback(
@@ -77,6 +82,8 @@ export function CompareGroupsPage() {
           filterRegex: search.filterRegex,
           gasBuckets: search.gasBuckets,
           diffFilter: search.diffFilter,
+          heatmapColor: search.heatmapColor,
+          heatmapThreshold: search.heatmapThreshold,
           ...patch,
         },
         replace: true,
@@ -136,10 +143,17 @@ export function CompareGroupsPage() {
     )
   }, [index, suiteHash, groups])
 
-  // Run IDs used for data fetching (truncated to sample size).
+  // The entries each group averages: its explicit selection, or the
+  // newest `sampleSize` matched entries.
+  const groupSampledEntries = useMemo(
+    () => groupMatchedEntries.map((entries, gi) => selectGroupRuns(groups[gi], entries, sampleSize)),
+    [groupMatchedEntries, groups, sampleSize],
+  )
+
+  // Run IDs used for data fetching.
   const groupRuns = useMemo(
-    () => groupMatchedEntries.map((entries) => entries.slice(0, sampleSize).map((e) => e.run_id)),
-    [groupMatchedEntries, sampleSize],
+    () => groupSampledEntries.map((entries) => entries.map((e) => e.run_id)),
+    [groupSampledEntries],
   )
 
   // Flatten all run IDs for batch fetching.
@@ -294,6 +308,9 @@ export function CompareGroupsPage() {
       ? Math.min(parseInt(search.tableBase, 10) || 0, syntheticRuns.length - 1)
       : 'best'
   const chartType: ChartType = (search.chart as ChartType) ?? 'line'
+  // Heatmap colour model, shared with the test detail modal.
+  const heatmapColorMode: HeatmapColorMode = search.heatmapColor === 'mgas' ? 'mgas' : 'baseline'
+  const heatmapThreshold = Math.max(MIN_THRESHOLD, Math.min(MAX_THRESHOLD, parseInt(search.heatmapThreshold ?? '', 10) || DEFAULT_THRESHOLD))
   const [sharedZoom, setSharedZoom] = useState(true)
   const [chartZoom, setChartZoom] = useState({ start: 0, end: 100 })
   const tableSortBy = (search.sort ?? 'order') as 'order' | 'name' | 'gasUsed' | 'avgValue' | `run-${number}`
@@ -398,11 +415,27 @@ export function CompareGroupsPage() {
     })
   }, [selectedTest, groups, groupRuns, resultQueries])
 
-  const groupTimestampsForModal = useMemo(() => {
-    return groupMatchedEntries.map((entries) =>
-      entries.slice(0, sampleSize).map((e) => e.timestamp),
-    )
-  }, [groupMatchedEntries, sampleSize])
+  // The averaged MGas/s per group for the selected test — the value the
+  // heatmap tile is coloured by. Keyed by group index, not by position in
+  // `syntheticRuns`, which skips a group without config or results.
+  const groupValuesForModal = useMemo(() => {
+    if (!selectedTest) return []
+    const values = new Array<number | undefined>(groups.length).fill(undefined)
+    for (const run of syntheticRuns) {
+      const entry = run.result?.tests[selectedTest]
+      const stats = entry ? getAggregatedStats(entry, stepFilter) : undefined
+      values[run.index] = stats && stats.gas_used_time_total > 0 ? (stats.gas_used_total * 1000) / stats.gas_used_time_total : undefined
+    }
+    return values
+  }, [selectedTest, groups.length, syntheticRuns, stepFilter])
+
+  // `baselineIdx` is a position in `syntheticRuns`; the modal works per group.
+  const baselineGroupIdx = syntheticRuns[baselineIdx]?.index ?? -1
+
+  const groupTimestampsForModal = useMemo(
+    () => groupSampledEntries.map((entries) => entries.map((e) => e.timestamp)),
+    [groupSampledEntries],
+  )
 
   return (
     <div className="flex flex-col gap-6">
@@ -443,16 +476,17 @@ export function CompareGroupsPage() {
         onSampleSizeChange={setSampleSize}
         aggMode={aggMode}
         onAggModeChange={setAggMode}
-        groupRunCounts={groupRuns.map((ids) => ids.length)}
+        groupSelectedRunIds={groupRuns}
         groupMatchedRuns={groupMatchedEntries}
         groupLoadingFlags={groupLoadingFlags}
+        indexLoading={indexLoading}
       />
       </div>
 
       {/* Sticky bar — appears when the group builder scrolls out of view */}
       {stickyVisible && hasResults && (
         <div className="fixed top-0 right-0 left-0 z-50 border-b border-gray-200 bg-white/95 backdrop-blur-sm dark:border-gray-700 dark:bg-gray-900/95">
-          <div className="mx-auto flex max-w-7xl flex-col gap-1 px-4 py-2">
+          <div className="mx-auto flex max-w-7xl wide:max-w-none flex-col gap-1 px-4 py-2">
             <div className="flex items-center justify-center gap-4">
               {groups.map((group, gi) => {
                 const metaStr = Object.entries(group.metadata).map(([k, v]) => `${k}=${v}`).join(', ')
@@ -552,6 +586,10 @@ export function CompareGroupsPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {indexLoading && suiteHash && groups.length > 0 && (
+        <LoadingState message="Loading the run index..." />
       )}
 
       {isLoading && allRunIds.length > 0 && (
@@ -697,6 +735,21 @@ export function CompareGroupsPage() {
             testNameFilter={testNameFilter}
           />
 
+          <GroupHeatmap
+            runs={syntheticRuns}
+            suiteTests={suite?.tests}
+            stepFilter={stepFilter}
+            labelMode="instance-id"
+            baselineIdx={baselineIdx}
+            onBaselineChange={(idx) => updateSearch({ baseline: idx > 0 ? String(idx) : undefined })}
+            colorMode={heatmapColorMode}
+            onColorModeChange={(mode) => updateSearch({ heatmapColor: mode === 'baseline' ? undefined : mode })}
+            threshold={heatmapThreshold}
+            onThresholdChange={(t) => updateSearch({ heatmapThreshold: t === DEFAULT_THRESHOLD ? undefined : String(t) })}
+            testNameFilter={testNameFilter}
+            onTestClick={setSelectedTest}
+          />
+
           <MGasComparisonChart
             runs={syntheticRuns}
             suiteTests={suite?.tests}
@@ -787,13 +840,20 @@ export function CompareGroupsPage() {
       {selectedTest && (
         <TestDetailModal
           testName={selectedTest}
-          testOrder={suite?.tests ? suite.tests.findIndex((t) => t.name === selectedTest) + 1 : undefined}
+          testOrder={(() => {
+            const idx = suite?.tests?.findIndex((t) => t.name === selectedTest) ?? -1
+            return idx >= 0 ? idx + 1 : undefined
+          })()}
+          suiteTest={suite?.tests?.find((t) => t.name === selectedTest)}
           groups={groups}
           groupResults={groupResultsForModal}
           groupTimestamps={groupTimestampsForModal}
           groupRunIds={groupRuns}
+          groupValues={groupValuesForModal}
+          baselineGroupIdx={baselineGroupIdx}
+          heatmapColorMode={heatmapColorMode}
+          heatmapThreshold={heatmapThreshold}
           stepFilter={stepFilter}
-          sampleSize={sampleSize}
           searchQuery={testFilter}
           onChipFilterToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
           onClose={() => setSelectedTest(null)}
