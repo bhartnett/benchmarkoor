@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/ethpandaops/benchmarkoor/pkg/cputopology"
 )
 
 // markdownRunConfig mirrors runner.RunConfig fields needed for markdown
@@ -30,20 +32,22 @@ type markdownRunConfig struct {
 }
 
 type markdownSystemInfo struct {
-	Hostname           string  `json:"hostname"`
-	OS                 string  `json:"os"`
-	Platform           string  `json:"platform"`
-	PlatformVersion    string  `json:"platform_version"`
-	KernelVersion      string  `json:"kernel_version"`
-	Arch               string  `json:"arch"`
-	Virtualization     string  `json:"virtualization,omitempty"`
-	VirtualizationRole string  `json:"virtualization_role,omitempty"`
-	CPUVendor          string  `json:"cpu_vendor"`
-	CPUModel           string  `json:"cpu_model"`
-	CPUCores           int     `json:"cpu_cores"`
-	CPUMhz             float64 `json:"cpu_mhz"`
-	CPUCacheKB         int     `json:"cpu_cache_kb"`
-	MemoryTotalGB      float64 `json:"memory_total_gb"`
+	Hostname           string            `json:"hostname"`
+	OS                 string            `json:"os"`
+	Platform           string            `json:"platform"`
+	PlatformVersion    string            `json:"platform_version"`
+	KernelVersion      string            `json:"kernel_version"`
+	Arch               string            `json:"arch"`
+	Virtualization     string            `json:"virtualization,omitempty"`
+	VirtualizationRole string            `json:"virtualization_role,omitempty"`
+	CPUVendor          string            `json:"cpu_vendor"`
+	CPUModel           string            `json:"cpu_model"`
+	CPUCores           int               `json:"cpu_cores"`
+	CPUThreads         int               `json:"cpu_threads,omitempty"`
+	CPUMhz             float64           `json:"cpu_mhz"`
+	CPUCacheKB         int               `json:"cpu_cache_kb"`
+	MemoryTotalGB      float64           `json:"memory_total_gb"`
+	CPUTopology        []cputopology.CPU `json:"cpu_topology,omitempty"`
 }
 
 type markdownInstance struct {
@@ -55,12 +59,13 @@ type markdownInstance struct {
 }
 
 type markdownResourceLimits struct {
-	CpusetCpus    string  `json:"cpuset_cpus,omitempty"`
-	Memory        string  `json:"memory,omitempty"`
-	MemoryBytes   int64   `json:"memory_bytes,omitempty"`
-	CPUFreqKHz    *uint64 `json:"cpu_freq_khz,omitempty"`
-	CPUTurboBoost *bool   `json:"cpu_turboboost,omitempty"`
-	CPUGovernor   string  `json:"cpu_freq_governor,omitempty"`
+	CpusetCpus     string  `json:"cpuset_cpus,omitempty"`
+	CpusetTopology string  `json:"cpuset_topology,omitempty"`
+	Memory         string  `json:"memory,omitempty"`
+	MemoryBytes    int64   `json:"memory_bytes,omitempty"`
+	CPUFreqKHz     *uint64 `json:"cpu_freq_khz,omitempty"`
+	CPUTurboBoost  *bool   `json:"cpu_turboboost,omitempty"`
+	CPUGovernor    string  `json:"cpu_freq_governor,omitempty"`
 }
 
 type markdownMetadata struct {
@@ -148,7 +153,7 @@ func GenerateRunMarkdown(
 	writeStepStats(&sb, steps)
 	writeStartBlock(&sb, cfg.StartBlock)
 	writeSystem(&sb, cfg.System)
-	writeResourceLimits(&sb, cfg.Instance)
+	writeResourceLimits(&sb, cfg.Instance, cfg.System)
 	writeMetadata(&sb, cfg.Metadata)
 
 	// Failed tests section is last — it gets truncated if needed.
@@ -234,6 +239,14 @@ func writeSystem(sb *strings.Builder, sys *markdownSystemInfo) {
 		fmt.Fprintf(sb, "| Cores | %d |\n", sys.CPUCores)
 	}
 
+	if sys.CPUThreads > 0 {
+		fmt.Fprintf(sb, "| Threads | %d |\n", sys.CPUThreads)
+	}
+
+	if layout := cputopology.Summary(sys.CPUTopology, nil); layout != "" {
+		fmt.Fprintf(sb, "| CPU Layout | %s |\n", layout)
+	}
+
 	if sys.CPUMhz > 0 {
 		fmt.Fprintf(sb, "| CPU MHz | %.1f |\n", sys.CPUMhz)
 	}
@@ -266,7 +279,7 @@ func writeSystem(sb *strings.Builder, sys *markdownSystemInfo) {
 	sb.WriteByte('\n')
 }
 
-func writeResourceLimits(sb *strings.Builder, inst *markdownInstance) {
+func writeResourceLimits(sb *strings.Builder, inst *markdownInstance, sys *markdownSystemInfo) {
 	if inst == nil || inst.ResourceLimits == nil {
 		return
 	}
@@ -286,6 +299,19 @@ func writeResourceLimits(sb *strings.Builder, inst *markdownInstance) {
 
 	if rl.CpusetCpus != "" {
 		fmt.Fprintf(sb, "| CPU Set | %s |\n", rl.CpusetCpus)
+
+		if rl.CpusetTopology != "" {
+			fmt.Fprintf(sb, "| CPU Set Topology | %s |\n", rl.CpusetTopology)
+		}
+
+		if sys != nil {
+			// Ignore a malformed cpuset: the raw value is already in the table.
+			if cpus, err := cputopology.ParseCPUList(rl.CpusetCpus); err == nil {
+				if layout := cputopology.Summary(sys.CPUTopology, cpus); layout != "" {
+					fmt.Fprintf(sb, "| CPU Layout | %s |\n", layout)
+				}
+			}
+		}
 	}
 
 	if rl.Memory != "" {

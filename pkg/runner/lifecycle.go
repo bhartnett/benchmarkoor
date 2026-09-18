@@ -19,6 +19,7 @@ import (
 	"github.com/ethpandaops/benchmarkoor/pkg/client"
 	"github.com/ethpandaops/benchmarkoor/pkg/config"
 	"github.com/ethpandaops/benchmarkoor/pkg/cpufreq"
+	"github.com/ethpandaops/benchmarkoor/pkg/cputopology"
 	"github.com/ethpandaops/benchmarkoor/pkg/datadir"
 	"github.com/ethpandaops/benchmarkoor/pkg/docker"
 	"github.com/ethpandaops/benchmarkoor/pkg/executor"
@@ -576,13 +577,15 @@ func (r *runner) runContainerLifecycle(
 	var resolvedResourceLimits *ResolvedResourceLimits
 	var targetCPUs []int // CPUs to apply cpu_freq settings to
 
+	systemInfo := getSystemInfo()
+
 	if r.cfg.FullConfig != nil {
 		resourceLimitsCfg := r.cfg.FullConfig.GetResourceLimits(instance)
 		if resourceLimitsCfg != nil {
 			var err error
 
 			containerResourceLimits, resolvedResourceLimits, err =
-				buildContainerResourceLimits(resourceLimitsCfg)
+				buildContainerResourceLimits(resourceLimitsCfg, systemInfo.CPUTopology)
 			if err != nil {
 				return fmt.Errorf("building resource limits: %w", err)
 			}
@@ -591,6 +594,10 @@ func (r *runner) runContainerLifecycle(
 				"cpuset_cpus":   resolvedResourceLimits.CpusetCpus,
 				"memory":        resolvedResourceLimits.Memory,
 				"swap_disabled": resolvedResourceLimits.SwapDisabled,
+			}
+
+			if resolvedResourceLimits.CpusetTopology != "" {
+				fields["cpuset_topology"] = resolvedResourceLimits.CpusetTopology
 			}
 
 			if resolvedResourceLimits.BlkioConfig != nil {
@@ -609,6 +616,12 @@ func (r *runner) runContainerLifecycle(
 					if cpuID, err := strconv.Atoi(strings.TrimSpace(cpuStr)); err == nil {
 						targetCPUs = append(targetCPUs, cpuID)
 					}
+				}
+
+				// Describe the cpuset in physical cores so a pinning that spreads
+				// one thread over many cores is visible in the log.
+				if layout := cputopology.Summary(systemInfo.CPUTopology, targetCPUs); layout != "" {
+					log.WithField("cpu_layout", layout).Info("CPU pinning layout")
 				}
 			}
 
@@ -664,7 +677,7 @@ func (r *runner) runContainerLifecycle(
 	runConfig := &RunConfig{
 		BenchmarkoorVersion: version.Version,
 		Timestamp:           params.RunTimestamp,
-		System:              getSystemInfo(),
+		System:              systemInfo,
 		Instance: &ResolvedInstance{
 			ID:     instance.ID,
 			Client: instance.Client,
@@ -1635,6 +1648,15 @@ func getSystemInfo() *SystemInfo {
 
 	if cores, err := cpu.Counts(false); err == nil {
 		info.CPUCores = cores
+	}
+
+	if threads, err := cpu.Counts(true); err == nil {
+		info.CPUThreads = threads
+	}
+
+	// The topology tree only exists on Linux. Leave it empty elsewhere.
+	if topology, err := cputopology.Read(cputopology.DefaultSysfsPath); err == nil {
+		info.CPUTopology = topology
 	}
 
 	if memInfo, err := mem.VirtualMemory(); err == nil {

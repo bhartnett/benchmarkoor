@@ -3,6 +3,7 @@ import clsx from 'clsx'
 import { Settings, Check, Copy, ChevronDown } from 'lucide-react'
 import type { InstanceConfig, SystemInfo, StartBlock } from '@/api/types'
 import { formatBytes, formatFrequency } from '@/utils/format'
+import { CPUTopologyGrid } from './CPUTopologyGrid'
 
 interface RunConfigurationProps {
   instance: InstanceConfig
@@ -570,6 +571,9 @@ export function RunConfiguration({ instance, system, startBlock, metadata, bench
               <InfoItem label="Architecture" value={system.arch} />
               <InfoItem label="CPU" value={system.cpu_model} />
               <InfoItem label="CPU Cores" value={system.cpu_cores} />
+              {system.cpu_threads !== undefined && (
+                <InfoItem label="CPU Threads" value={system.cpu_threads} />
+              )}
               <InfoItem label="CPU MHz" value={system.cpu_mhz.toFixed(0)} />
               <InfoItem label="CPU Cache" value={`${system.cpu_cache_kb} KB`} />
               <InfoItem label="Memory" value={`${system.memory_total_gb.toFixed(1)} GB`} />
@@ -590,6 +594,9 @@ export function RunConfiguration({ instance, system, startBlock, metadata, bench
                         value={instance.resource_limits.cpuset_cpus.split(',').length}
                       />
                       <InfoItem label="CPU Pinning" value={instance.resource_limits.cpuset_cpus} />
+                      {instance.resource_limits.cpuset_topology && (
+                        <InfoItem label="CPU Pinning Topology" value={instance.resource_limits.cpuset_topology} />
+                      )}
                     </>
                   )}
                   {instance.resource_limits.memory && (
@@ -673,6 +680,14 @@ export function RunConfiguration({ instance, system, startBlock, metadata, bench
                     </div>
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* CPU Layout */}
+            {system.cpu_topology && system.cpu_topology.length > 0 && (
+              <div className="mt-6 border-t border-gray-200 pt-6 dark:border-gray-700">
+                <h4 className="mb-3 text-sm/6 font-medium text-gray-900 dark:text-gray-100">CPU Layout</h4>
+                <CPUTopologyGrid topology={system.cpu_topology} cpuset={instance.resource_limits?.cpuset_cpus} />
               </div>
             )}
 
