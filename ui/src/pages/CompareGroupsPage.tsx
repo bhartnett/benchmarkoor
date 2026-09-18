@@ -13,11 +13,12 @@ import { FacetPanel } from '@/components/shared/FacetPanel'
 import { CompareDimensionInsights } from '@/components/compare/CompareDimensionInsights'
 import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER, getAggregatedStats } from '@/pages/RunDetailPage'
 import { type CompareRun, type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
-import { MetricsComparison } from '@/components/compare/MetricsComparison'
 import { MGasComparisonChart } from '@/components/compare/MGasComparisonChart'
 import { GroupHeatmap } from '@/components/compare/GroupHeatmap'
-import { type HeatmapColorMode } from '@/components/compare/heatmapColor'
-import { DEFAULT_THRESHOLD, MAX_THRESHOLD, MIN_THRESHOLD } from '@/utils/perfThreshold'
+import { GroupRanking } from '@/components/compare/GroupRanking'
+import { computeMetrics } from '@/components/compare/compareMetrics'
+import { type HeatmapColorModel } from '@/components/compare/heatmapColor'
+import { DEFAULT_SLOW_MS, DEFAULT_THRESHOLD, MAX_SLOW_MS, MAX_THRESHOLD, MIN_SLOW_MS, MIN_THRESHOLD } from '@/utils/perfThreshold'
 import { CVComparisonChart } from '@/components/compare/CVComparisonChart'
 import { PercentageDiffChart } from '@/components/compare/PercentageDiffChart'
 import { TestComparisonTable } from '@/components/compare/TestComparisonTable'
@@ -50,8 +51,11 @@ export function CompareGroupsPage() {
     filterRegex?: string
     gasBuckets?: string
     diffFilter?: string
+    heatmapMetric?: string
     heatmapColor?: string
     heatmapThreshold?: string
+    heatmapSlowMs?: string
+    testModal?: string
   }
 
   const suiteHash = search.suite ?? ''
@@ -82,8 +86,11 @@ export function CompareGroupsPage() {
           filterRegex: search.filterRegex,
           gasBuckets: search.gasBuckets,
           diffFilter: search.diffFilter,
+          heatmapMetric: search.heatmapMetric,
           heatmapColor: search.heatmapColor,
           heatmapThreshold: search.heatmapThreshold,
+          heatmapSlowMs: search.heatmapSlowMs,
+          testModal: search.testModal,
           ...patch,
         },
         replace: true,
@@ -301,7 +308,31 @@ export function CompareGroupsPage() {
   }, [index, suiteHash])
 
   // ─── Table/chart controls ─────────────────────────────────────
-  const baselineIdx = Math.min(Math.max(parseInt(search.baseline ?? '0', 10) || 0, 0), Math.max(syntheticRuns.length - 1, 0))
+  // Without a `baseline` param the slowest group is the baseline, by its
+  // overall MGas/s over every test, so the other groups read as gains
+  // against it. The page filter is left out so the default does not
+  // jump around while you filter.
+  const defaultBaselineIdx = useMemo(() => {
+    let slowest = 0
+    let slowestMgas = Infinity
+    syntheticRuns.forEach((run, i) => {
+      const mgas = computeMetrics(run.config, run.result, stepFilter).mgasPerSec
+      if (mgas !== undefined && mgas < slowestMgas) {
+        slowest = i
+        slowestMgas = mgas
+      }
+    })
+    return slowest
+  }, [syntheticRuns, stepFilter])
+  const baselineIdx = search.baseline !== undefined
+    ? Math.min(Math.max(parseInt(search.baseline, 10) || 0, 0), Math.max(syntheticRuns.length - 1, 0))
+    : defaultBaselineIdx
+  // The default is a computed value, so an explicit pick of it drops the
+  // param and keeps the URL clean; any other pick is written out.
+  const setBaselineIdx = useCallback(
+    (idx: number) => updateSearch({ baseline: idx === defaultBaselineIdx ? undefined : String(idx) }),
+    [updateSearch, defaultBaselineIdx],
+  )
   const tableBaseline: 'best' | 'worst' | number = search.tableBase === 'worst'
     ? 'worst'
     : search.tableBase !== undefined && search.tableBase !== 'best'
@@ -309,8 +340,21 @@ export function CompareGroupsPage() {
       : 'best'
   const chartType: ChartType = (search.chart as ChartType) ?? 'line'
   // Heatmap colour model, shared with the test detail modal.
-  const heatmapColorMode: HeatmapColorMode = search.heatmapColor === 'mgas' ? 'mgas' : 'baseline'
-  const heatmapThreshold = Math.max(MIN_THRESHOLD, Math.min(MAX_THRESHOLD, parseInt(search.heatmapThreshold ?? '', 10) || DEFAULT_THRESHOLD))
+  const heatmapModel = useMemo<HeatmapColorModel>(() => ({
+    metric: search.heatmapMetric === 'duration' ? 'duration' : 'mgas',
+    // Absolute is the default; 'mgas' is the value older links carry for it.
+    mode: search.heatmapColor === 'baseline' ? 'baseline' : 'absolute',
+    threshold: Math.max(MIN_THRESHOLD, Math.min(MAX_THRESHOLD, parseInt(search.heatmapThreshold ?? '', 10) || DEFAULT_THRESHOLD)),
+    slowMs: Math.max(MIN_SLOW_MS, Math.min(MAX_SLOW_MS, parseInt(search.heatmapSlowMs ?? '', 10) || DEFAULT_SLOW_MS)),
+  }), [search.heatmapMetric, search.heatmapColor, search.heatmapThreshold, search.heatmapSlowMs])
+  const updateHeatmapModel = useCallback((patch: Partial<HeatmapColorModel>) => {
+    const next: Record<string, string | undefined> = {}
+    if (patch.metric !== undefined) next.heatmapMetric = patch.metric === 'mgas' ? undefined : patch.metric
+    if (patch.mode !== undefined) next.heatmapColor = patch.mode === 'absolute' ? undefined : patch.mode
+    if (patch.threshold !== undefined) next.heatmapThreshold = patch.threshold === DEFAULT_THRESHOLD ? undefined : String(patch.threshold)
+    if (patch.slowMs !== undefined) next.heatmapSlowMs = patch.slowMs === DEFAULT_SLOW_MS ? undefined : String(patch.slowMs)
+    updateSearch(next)
+  }, [updateSearch])
   const [sharedZoom, setSharedZoom] = useState(true)
   const [chartZoom, setChartZoom] = useState({ start: 0, end: 100 })
   const tableSortBy = (search.sort ?? 'order') as 'order' | 'name' | 'gasUsed' | 'avgValue' | `run-${number}`
@@ -397,7 +441,16 @@ export function CompareGroupsPage() {
   }, [])
 
   // ─── Test detail modal ─────────────────────────────────────────
-  const [selectedTest, setSelectedTest] = useState<string | null>(null)
+  // Group whose won tests the heatmap highlights, picked in the ranking.
+  const [highlightGroupIdx, setHighlightGroupIdx] = useState<number | null>(null)
+
+  // The open test modal lives in the URL, the same `testModal` param as
+  // the run page, so a link opens straight on the test.
+  const selectedTest = search.testModal || null
+  const setSelectedTest = useCallback(
+    (name: string | null) => updateSearch({ testModal: name || undefined }),
+    [updateSearch],
+  )
 
   // Per-group individual results (not averaged) for the detail modal.
   const groupResultsForModal = useMemo(() => {
@@ -415,18 +468,22 @@ export function CompareGroupsPage() {
     })
   }, [selectedTest, groups, groupRuns, resultQueries])
 
-  // The averaged MGas/s per group for the selected test — the value the
-  // heatmap tile is coloured by. Keyed by group index, not by position in
-  // `syntheticRuns`, which skips a group without config or results.
+  // The averaged MGas/s and payload time per group for the selected test
+  // — the values the heatmap tile is coloured by. Keyed by group index,
+  // not by position in `syntheticRuns`, which skips a group without
+  // config or results.
   const groupValuesForModal = useMemo(() => {
-    if (!selectedTest) return []
-    const values = new Array<number | undefined>(groups.length).fill(undefined)
+    const mgas = new Array<number | undefined>(groups.length).fill(undefined)
+    const durations = new Array<number | undefined>(groups.length).fill(undefined)
+    if (!selectedTest) return { mgas, durations }
     for (const run of syntheticRuns) {
       const entry = run.result?.tests[selectedTest]
       const stats = entry ? getAggregatedStats(entry, stepFilter) : undefined
-      values[run.index] = stats && stats.gas_used_time_total > 0 ? (stats.gas_used_total * 1000) / stats.gas_used_time_total : undefined
+      if (!stats || stats.gas_used_time_total <= 0) continue
+      mgas[run.index] = (stats.gas_used_total * 1000) / stats.gas_used_time_total
+      durations[run.index] = stats.gas_used_time_total
     }
-    return values
+    return { mgas, durations }
   }, [selectedTest, groups.length, syntheticRuns, stepFilter])
 
   // `baselineIdx` is a position in `syntheticRuns`; the modal works per group.
@@ -726,13 +783,15 @@ export function CompareGroupsPage() {
             onToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
           />
 
-          <MetricsComparison
+          <GroupRanking
             runs={syntheticRuns}
             stepFilter={stepFilter}
-            baselineIdx={baselineIdx}
-            onBaselineChange={(idx) => updateSearch({ baseline: idx > 0 ? String(idx) : undefined })}
             labelMode="instance-id" // shows the group label we set
             testNameFilter={testNameFilter}
+            baselineIdx={baselineIdx}
+            onBaselineChange={setBaselineIdx}
+            highlightGroupIdx={highlightGroupIdx}
+            onHighlightChange={setHighlightGroupIdx}
           />
 
           <GroupHeatmap
@@ -741,13 +800,13 @@ export function CompareGroupsPage() {
             stepFilter={stepFilter}
             labelMode="instance-id"
             baselineIdx={baselineIdx}
-            onBaselineChange={(idx) => updateSearch({ baseline: idx > 0 ? String(idx) : undefined })}
-            colorMode={heatmapColorMode}
-            onColorModeChange={(mode) => updateSearch({ heatmapColor: mode === 'baseline' ? undefined : mode })}
-            threshold={heatmapThreshold}
-            onThresholdChange={(t) => updateSearch({ heatmapThreshold: t === DEFAULT_THRESHOLD ? undefined : String(t) })}
+            onBaselineChange={setBaselineIdx}
+            model={heatmapModel}
+            onModelChange={updateHeatmapModel}
             testNameFilter={testNameFilter}
             onTestClick={setSelectedTest}
+            highlightGroupIdx={highlightGroupIdx}
+            onHighlightChange={setHighlightGroupIdx}
           />
 
           <MGasComparisonChart
@@ -768,7 +827,7 @@ export function CompareGroupsPage() {
               suiteTests={suite?.tests}
               stepFilter={stepFilter}
               baselineIdx={baselineIdx}
-              onBaselineChange={(idx) => updateSearch({ baseline: idx > 0 ? String(idx) : undefined })}
+              onBaselineChange={setBaselineIdx}
               labelMode="instance-id"
               diffFilter={search.diffFilter === 'faster' || search.diffFilter === 'slower' ? search.diffFilter : 'all'}
               onDiffFilterChange={(val) => updateFilterSearch({ diffFilter: val === 'all' ? undefined : val })}
@@ -837,7 +896,8 @@ export function CompareGroupsPage() {
       )}
 
       {/* Test detail modal — shows per-run breakdown for a single test */}
-      {selectedTest && (
+      {/* Wait for the results, so a shared link opens the modal with data. */}
+      {selectedTest && hasResults && (
         <TestDetailModal
           testName={selectedTest}
           testOrder={(() => {
@@ -849,10 +909,10 @@ export function CompareGroupsPage() {
           groupResults={groupResultsForModal}
           groupTimestamps={groupTimestampsForModal}
           groupRunIds={groupRuns}
-          groupValues={groupValuesForModal}
+          groupMgas={groupValuesForModal.mgas}
+          groupDurations={groupValuesForModal.durations}
           baselineGroupIdx={baselineGroupIdx}
-          heatmapColorMode={heatmapColorMode}
-          heatmapThreshold={heatmapThreshold}
+          heatmapModel={heatmapModel}
           stepFilter={stepFilter}
           searchQuery={testFilter}
           onChipFilterToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
