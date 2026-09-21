@@ -14,7 +14,7 @@ import { CompareDimensionInsights } from '@/components/compare/CompareDimensionI
 import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER, getAggregatedStats } from '@/pages/RunDetailPage'
 import { type CompareRun, type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
 import { MGasComparisonChart } from '@/components/compare/MGasComparisonChart'
-import { GroupHeatmap } from '@/components/compare/GroupHeatmap'
+import { type SortMode, GroupHeatmap } from '@/components/compare/GroupHeatmap'
 import { GroupRanking } from '@/components/compare/GroupRanking'
 import { computeMetrics } from '@/components/compare/compareMetrics'
 import { type HeatmapColorModel } from '@/components/compare/heatmapColor'
@@ -55,7 +55,9 @@ export function CompareGroupsPage() {
     heatmapColor?: string
     heatmapThreshold?: string
     heatmapSlowMs?: string
+    heatmapSort?: string
     testModal?: string
+    testExpand?: string
   }
 
   const suiteHash = search.suite ?? ''
@@ -90,7 +92,9 @@ export function CompareGroupsPage() {
           heatmapColor: search.heatmapColor,
           heatmapThreshold: search.heatmapThreshold,
           heatmapSlowMs: search.heatmapSlowMs,
+          heatmapSort: search.heatmapSort,
           testModal: search.testModal,
+          testExpand: search.testExpand,
           ...patch,
         },
         replace: true,
@@ -355,6 +359,12 @@ export function CompareGroupsPage() {
     if (patch.slowMs !== undefined) next.heatmapSlowMs = patch.slowMs === DEFAULT_SLOW_MS ? undefined : String(patch.slowMs)
     updateSearch(next)
   }, [updateSearch])
+  // Test order of the heatmap. 'order' is the default, so it stays out of the URL.
+  const heatmapSort: SortMode = search.heatmapSort === 'spread' || search.heatmapSort === 'avg' ? search.heatmapSort : 'order'
+  const setHeatmapSort = useCallback(
+    (mode: SortMode) => updateSearch({ heatmapSort: mode === 'order' ? undefined : mode }),
+    [updateSearch],
+  )
   const [sharedZoom, setSharedZoom] = useState(true)
   const [chartZoom, setChartZoom] = useState({ start: 0, end: 100 })
   const tableSortBy = (search.sort ?? 'order') as 'order' | 'name' | 'gasUsed' | 'avgValue' | `run-${number}`
@@ -448,7 +458,17 @@ export function CompareGroupsPage() {
   // the run page, so a link opens straight on the test.
   const selectedTest = search.testModal || null
   const setSelectedTest = useCallback(
-    (name: string | null) => updateSearch({ testModal: name || undefined }),
+    (name: string | null) => updateSearch(name ? { testModal: name } : { testModal: undefined, testExpand: undefined }),
+    [updateSearch],
+  )
+
+  // Open sections of the modal, so a shared link keeps them open.
+  const testExpand = useMemo(
+    () => new Set((search.testExpand ?? '').split(',').filter(Boolean)),
+    [search.testExpand],
+  )
+  const setTestExpand = useCallback(
+    (next: Set<string>) => updateSearch({ testExpand: [...next].join(',') || undefined }),
     [updateSearch],
   )
 
@@ -803,6 +823,8 @@ export function CompareGroupsPage() {
             onBaselineChange={setBaselineIdx}
             model={heatmapModel}
             onModelChange={updateHeatmapModel}
+            sortMode={heatmapSort}
+            onSortModeChange={setHeatmapSort}
             testNameFilter={testNameFilter}
             onTestClick={setSelectedTest}
             highlightGroupIdx={highlightGroupIdx}
@@ -905,6 +927,7 @@ export function CompareGroupsPage() {
             return idx >= 0 ? idx + 1 : undefined
           })()}
           suiteTest={suite?.tests?.find((t) => t.name === selectedTest)}
+          suiteHash={suiteHash}
           groups={groups}
           groupResults={groupResultsForModal}
           groupTimestamps={groupTimestampsForModal}
@@ -914,6 +937,8 @@ export function CompareGroupsPage() {
           baselineGroupIdx={baselineGroupIdx}
           heatmapModel={heatmapModel}
           stepFilter={stepFilter}
+          expanded={testExpand}
+          onExpandedChange={setTestExpand}
           searchQuery={testFilter}
           onChipFilterToggle={(term) => updateFilterSearch({ filter: toggleSearchTerm(testFilter, term) || undefined })}
           onClose={() => setSelectedTest(null)}

@@ -6,6 +6,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useTestRequests, useTestResponses, useTestResultDetails, useTestRequestSummaries, useTestResponseSummaries, type StepType } from '@/api/hooks/useTestDetails'
 import { fetchPartialText } from '@/api/client'
+import type { PayloadSizeBuckets } from '@/api/types'
 import { Duration } from '@/components/shared/Duration'
 import {
   DEFAULT_SLOW_MS,
@@ -70,7 +71,12 @@ function JsonBlock({ code }: { code: string }) {
 }
 
 interface ExecutionsListProps {
-  runId: string
+  /**
+   * Run that holds the responses, the timings and the statuses. Leave it
+   * out for a suite-only list: the rows then show the request side alone,
+   * which is the same for every run of the suite.
+   */
+  runId?: string
   suiteHash: string
   testName: string
   stepType: StepType
@@ -82,10 +88,25 @@ interface ExecutionsListProps {
    * row position — non-newPayload methods consume no slot.
    */
   txCounts?: number[]
+  /**
+   * Per-newPayload byte counts for the active step (typically
+   * suiteTest.payload_sizes[stepType]). Indexed by newPayload order, the
+   * same convention as `txCounts`.
+   */
+  payloadSizes?: PayloadSizeBuckets
   /** Slow-threshold MGas/s the per-call values colour against. */
   threshold?: number
   /** Slow-payload limit in milliseconds the payload times colour against. */
   slowMs?: number
+}
+
+/** Encoded sizes of one engine_newPayload, taken from the suite. */
+interface PayloadSize {
+  ssz: number
+  bal: number
+  snappy: number
+  json: number
+  jsonBal: number
 }
 
 function parseMethod(request: string): string {
@@ -103,6 +124,17 @@ function formatJson(json: string): string {
   } catch {
     return json
   }
+}
+
+/** Tooltip of the size badge: every encoding of the same payload. */
+function payloadSizeTitle({ ssz, bal, snappy, json, jsonBal }: PayloadSize): string {
+  const pct = (part: number, whole: number) => (whole > 0 ? ` (${((part / whole) * 100).toFixed(1)}%)` : '')
+  const lines = [`SSZ ${formatBytes(ssz)}`]
+  if (bal > 0) lines.push(`SSZ BAL ${formatBytes(bal)}${pct(bal, ssz)}`)
+  if (snappy > 0) lines.push(`SSZ snappy ${formatBytes(snappy)}${pct(snappy, ssz)}`)
+  if (json > 0) lines.push(`JSON ${formatBytes(json)}`)
+  if (jsonBal > 0) lines.push(`JSON BAL ${formatBytes(jsonBal)}${pct(jsonBal, json)}`)
+  return lines.join('\n')
 }
 
 function formatBytes(bytes: number): string {
@@ -136,10 +168,14 @@ interface ExecutionRowProps {
   gasUsed?: number
   /** Transaction count for this row when the method is engine_newPayloadV*. */
   txCount?: number
+  /** Encoded sizes of this row's payload, when the method is engine_newPayloadV*. */
+  payloadSize?: PayloadSize
   /** File viewer link for the response file at this line. */
   responseViewerUrl?: string
   /** File viewer link for the request file at this line. */
   requestViewerUrl?: string
+  /** Drop the columns that need a run: the response size, the timings and the status. */
+  requestsOnly?: boolean
   /** Slow-threshold MGas/s the call's MGas/s colours against. */
   threshold: number
   /** Slow-payload limit in milliseconds the call's time colours against. */
@@ -167,7 +203,7 @@ function StatusIndicator({ status }: { status?: number }) {
 
 const MAX_LAZY_LINE_SIZE = 1_000_000 // 1MB — lazy-load lines up to this size
 
-function ExecutionRow({ index, request, requestSize, methodName, requestLineInfo, response, responseSize, time, status, mgasPerSec, gasUsed, txCount, responseViewerUrl, requestViewerUrl, threshold, slowMs, expanded: expandedProp, onExpandedChange }: ExecutionRowProps & { expanded?: boolean; onExpandedChange?: (index: number, expanded: boolean) => void }) {
+function ExecutionRow({ index, request, requestSize, methodName, requestLineInfo, response, responseSize, time, status, mgasPerSec, gasUsed, txCount, payloadSize, responseViewerUrl, requestViewerUrl, requestsOnly = false, threshold, slowMs, expanded: expandedProp, onExpandedChange }: ExecutionRowProps & { expanded?: boolean; onExpandedChange?: (index: number, expanded: boolean) => void }) {
   const [expandedLocal, setExpandedLocal] = useState(false)
   const expanded = expandedProp ?? expandedLocal
   const setExpanded = (v: boolean) => {
@@ -234,57 +270,80 @@ function ExecutionRow({ index, request, requestSize, methodName, requestLineInfo
             </span>
           )}
         </span>
-        <span
-          className={clsx(
-            'w-44 shrink-0 text-right text-sm/6 font-medium',
-            mgasPerSec !== undefined ? getTextClassByThreshold(mgasPerSec, threshold) : '',
+        {!requestsOnly && (
+          <span
+            className={clsx(
+              'w-44 shrink-0 text-right text-sm/6 font-medium',
+              mgasPerSec !== undefined ? getTextClassByThreshold(mgasPerSec, threshold) : '',
+            )}
+            title={mgasPerSec !== undefined ? `Threshold ${threshold} MGas/s` : undefined}
+          >
+            {mgasPerSec !== undefined ? (
+              <>
+                {mgasPerSec.toFixed(2)} MGas/s
+                {gasUsed !== undefined && (
+                  <span className="ml-1 font-normal text-gray-500 dark:text-gray-400">
+                    ({(gasUsed / 1e6).toFixed(2)}M)
+                  </span>
+                )}
+              </>
+            ) : ''}
+          </span>
+        )}
+        {!requestsOnly && (
+          <span
+            className={clsx(
+              'w-16 shrink-0 text-right text-sm/6',
+              // Only a call that executed gas is a payload, so only it
+              // colours against the slow-payload limit.
+              time !== undefined && isPayload
+                ? getTextClassByDuration(time, slowMs)
+                : 'text-gray-500 dark:text-gray-400',
+            )}
+            title={time !== undefined && isPayload ? `Slow-payload limit ${formatSlowMs(slowMs)}` : undefined}
+          >
+            {time !== undefined ? <Duration nanoseconds={time} /> : ''}
+          </span>
+        )}
+        <span className="w-24 shrink-0 text-right">
+          {payloadSize !== undefined && payloadSize.ssz > 0 && (
+            <span
+              className="inline-block rounded-xs bg-sky-100 px-1.5 py-0.5 text-xs/5 font-medium text-sky-700 dark:bg-sky-900/40 dark:text-sky-300"
+              title={payloadSizeTitle(payloadSize)}
+            >
+              {formatBytes(payloadSize.ssz)} SSZ
+            </span>
           )}
-          title={mgasPerSec !== undefined ? `Threshold ${threshold} MGas/s` : undefined}
-        >
-          {mgasPerSec !== undefined ? (
+        </span>
+        <span className="w-40 shrink-0 text-right text-xs text-gray-400 dark:text-gray-500">
+          {requestSize !== undefined || request ? (
+            <span
+              className="inline-block rounded-xs bg-emerald-100 px-1.5 py-0.5 text-xs/5 font-medium text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+              title="JSON-RPC request size, the whole line"
+            >
+              {formatBytes(requestSize ?? new Blob([request!]).size)} JSON
+            </span>
+          ) : (
+            <span className="inline-block size-2.5 animate-spin rounded-full border border-gray-300 border-t-gray-500" />
+          )}
+          {!requestsOnly && (
             <>
-              {mgasPerSec.toFixed(2)} MGas/s
-              {gasUsed !== undefined && (
-                <span className="ml-1 font-normal text-gray-500 dark:text-gray-400">
-                  ({(gasUsed / 1e6).toFixed(2)}M)
+              {' / '}
+              {responseSize !== undefined || response ? (
+                <span title="JSON-RPC response size, the whole line">
+                  {formatBytes(responseSize ?? new Blob([response!]).size)}
                 </span>
+              ) : (
+                <span className="inline-block size-2.5 animate-spin rounded-full border border-gray-300 border-t-gray-500" />
               )}
             </>
-          ) : ''}
-        </span>
-        <span
-          className={clsx(
-            'w-16 shrink-0 text-right text-sm/6',
-            // Only a call that executed gas is a payload, so only it
-            // colours against the slow-payload limit.
-            time !== undefined && isPayload
-              ? getTextClassByDuration(time, slowMs)
-              : 'text-gray-500 dark:text-gray-400',
-          )}
-          title={time !== undefined && isPayload ? `Slow-payload limit ${formatSlowMs(slowMs)}` : undefined}
-        >
-          {time !== undefined ? <Duration nanoseconds={time} /> : ''}
-        </span>
-        <span className="w-28 shrink-0 text-right text-xs text-gray-400 dark:text-gray-500">
-          {requestSize !== undefined || request ? (
-            <span title="Request size">
-              {formatBytes(requestSize ?? new Blob([request!]).size)}
-            </span>
-          ) : (
-            <span className="inline-block size-2.5 animate-spin rounded-full border border-gray-300 border-t-gray-500" />
-          )}
-          {' / '}
-          {responseSize !== undefined || response ? (
-            <span title="Response size">
-              {formatBytes(responseSize ?? new Blob([response!]).size)}
-            </span>
-          ) : (
-            <span className="inline-block size-2.5 animate-spin rounded-full border border-gray-300 border-t-gray-500" />
           )}
         </span>
-        <span className="w-12 shrink-0 text-right">
-          <StatusIndicator status={status} />
-        </span>
+        {!requestsOnly && (
+          <span className="w-12 shrink-0 text-right">
+            <StatusIndicator status={status} />
+          </span>
+        )}
       </button>
 
       {expanded && (
@@ -372,7 +431,10 @@ function ExecutionRow({ index, request, requestSize, methodName, requestLineInfo
 
 const EXECUTIONS_PAGE_SIZE = 100
 
-export function ExecutionsList({ runId, suiteHash, testName, stepType, expandedRows, onExpandedRowsChange, txCounts, threshold = DEFAULT_THRESHOLD, slowMs = DEFAULT_SLOW_MS }: ExecutionsListProps) {
+export function ExecutionsList({ runId = '', suiteHash, testName, stepType, expandedRows, onExpandedRowsChange, txCounts, payloadSizes, threshold = DEFAULT_THRESHOLD, slowMs = DEFAULT_SLOW_MS }: ExecutionsListProps) {
+  // Without a run there are no responses, no timings and no statuses. The
+  // hooks below stay disabled and the rows keep the request side only.
+  const requestsOnly = !runId
   const { data: requests, isLoading: requestsLoading, error: requestsError } = useTestRequests(suiteHash, testName, stepType)
   const { data: responses, error: responsesError } = useTestResponses(runId, testName, stepType)
   const { data: resultDetails, isLoading: detailsLoading, error: detailsError } = useTestResultDetails(runId, testName, stepType)
@@ -399,8 +461,11 @@ export function ExecutionsList({ runId, suiteHash, testName, stepType, expandedR
   const safeResponses = responsesError ? undefined : responses
   const safeDetails = detailsError ? undefined : resultDetails
 
-  // Wait for at least one data source (details or requests) to be ready
-  const isLoading = (!requestsError && requestsLoading) && (!detailsError && detailsLoading)
+  // Wait for at least one data source (details or requests) to be ready.
+  // The suite-only list has the requests as its one source.
+  const isLoading = requestsOnly
+    ? !requestsError && requestsLoading
+    : (!requestsError && requestsLoading) && (!detailsError && detailsLoading)
 
   if (isLoading) {
     return (
@@ -429,13 +494,13 @@ export function ExecutionsList({ runId, suiteHash, testName, stepType, expandedR
   const startIdx = (page - 1) * EXECUTIONS_PAGE_SIZE
   const endIdx = Math.min(startIdx + EXECUTIONS_PAGE_SIZE, executionCount)
 
-  // Map row index → tx count. tx_counts is indexed by newPayload order,
-  // not row position, so we walk all rows up to endIdx once to assign
-  // each newPayload row its slot. Returns a Map keyed by absolute row
-  // index (not page-relative).
-  const txCountByRow = (() => {
-    if (!txCounts || txCounts.length === 0) return new Map<number, number>()
+  // Map row index → newPayload ordinal. The suite arrays (tx counts,
+  // payload sizes) are indexed by newPayload order, not by row position,
+  // so we walk every row once to assign each newPayload row its slot.
+  // The Map is keyed by absolute row index (not page-relative).
+  const npIndexByRow = (() => {
     const out = new Map<number, number>()
+    if (!txCounts?.length && !payloadSizes) return out
     let nextNp = 0
     const rowMethod = (i: number): string | undefined => {
       const req = safeRequests?.[i]
@@ -444,19 +509,34 @@ export function ExecutionsList({ runId, suiteHash, testName, stepType, expandedR
     }
     for (let i = 0; i < executionCount; i++) {
       const m = rowMethod(i)
-      if (m && m.startsWith('engine_newPayloadV')) {
-        if (nextNp < txCounts.length) out.set(i, txCounts[nextNp])
-        nextNp++
-      }
+      if (m && m.startsWith('engine_newPayloadV')) out.set(i, nextNp++)
     }
     return out
   })()
+
+  const txCountOf = (row: number): number | undefined => {
+    const np = npIndexByRow.get(row)
+    return np !== undefined ? txCounts?.[np] : undefined
+  }
+  const payloadSizeOf = (row: number): PayloadSize | undefined => {
+    const np = npIndexByRow.get(row)
+    if (np === undefined || !payloadSizes) return undefined
+    const ssz = payloadSizes.ssz_full[np] ?? 0
+    if (ssz === 0) return undefined
+    return {
+      ssz,
+      bal: payloadSizes.ssz_bal[np] ?? 0,
+      snappy: payloadSizes.ssz_full_snappy[np] ?? 0,
+      json: payloadSizes.json_full[np] ?? 0,
+      jsonBal: payloadSizes.json_bal[np] ?? 0,
+    }
+  }
 
   return (
     <div className="mt-4 max-w-full overflow-hidden">
       <div className="mb-2 flex items-center justify-between">
         <h4 className="text-sm/6 font-medium text-gray-900 dark:text-gray-100">
-          Executions ({executionCount})
+          {requestsOnly ? 'Requests' : 'Executions'} ({executionCount})
         </h4>
         {totalDurationNs > 0 && (
           <span className="text-sm/6 text-gray-500 dark:text-gray-400">
@@ -488,13 +568,15 @@ export function ExecutionsList({ runId, suiteHash, testName, stepType, expandedR
               status={safeDetails?.status[index]}
               mgasPerSec={safeDetails?.mgas_s[String(index)]}
               gasUsed={safeDetails?.gas_used[String(index)]}
-              txCount={txCountByRow.get(index)}
+              txCount={txCountOf(index)}
+              payloadSize={payloadSizeOf(index)}
+              requestsOnly={requestsOnly}
               threshold={threshold}
               slowMs={slowMs}
-              responseViewerUrl={!safeResponses?.[index] && responseSummaries?.[index] && responseSummaries[index].size > 1_000_000
+              responseViewerUrl={!requestsOnly && !safeResponses?.[index] && responseSummaries?.[index] && responseSummaries[index].size > 1_000_000
                 ? `/runs/${runId}/fileviewer?file=${encodeURIComponent(`${testName}/${stepType}.response`)}&lines=${index + 1}`
                 : undefined}
-              requestViewerUrl={!safeRequests?.[index] && requestSummaries?.[index] && requestSummaries[index].size > 1_000_000
+              requestViewerUrl={!requestsOnly && !safeRequests?.[index] && requestSummaries?.[index] && requestSummaries[index].size > 1_000_000
                 ? `/runs/${runId}/fileviewer?base=${encodeURIComponent(`suites/${suiteHash}`)}&file=${encodeURIComponent(`${testName}/${stepType}.request`)}&lines=${index + 1}`
                 : undefined}
               expanded={expandedRows?.has(index)}

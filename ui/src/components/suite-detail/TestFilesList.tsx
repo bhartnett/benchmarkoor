@@ -1,6 +1,6 @@
-import { Fragment, useState } from 'react'
+import { useEffect, useState } from 'react'
 import clsx from 'clsx'
-import { Copy, Check, Search, ArrowDown, ArrowUp } from 'lucide-react'
+import { Copy, Check, Search, ArrowDown, ArrowUp, ExternalLink } from 'lucide-react'
 import { useQuery } from '@tanstack/react-query'
 import type { SuiteFile, SuiteTest } from '@/api/types'
 import { fetchText } from '@/api/client'
@@ -223,84 +223,243 @@ function SearchIcon({ className }: { className?: string }) {
   return <Search className={className} />
 }
 
-// Component for displaying EEST fixture info and opcode counts
+/** The file and the line of a source link, e.g. "test_arithmetic.py#L40". */
+function sourceLabel(url: string): string {
+  try {
+    const parsed = new URL(url)
+    const file = parsed.pathname.split('/').filter(Boolean).pop()
+    return file ? `${file}${parsed.hash}` : parsed.host
+  } catch {
+    return url
+  }
+}
+
+/** Head and tail of a long hash, e.g. "0xfe2ed6c0…fcd62c3b63d". */
+function shortHash(hash: string): string {
+  return hash.length > 22 ? `${hash.slice(0, 10)}…${hash.slice(-11)}` : hash
+}
+
+/** Client and version of a filling tool, e.g. "Geth v1.17.6-unstable-…". */
+function fillingToolLabel(tool: string): string {
+  const inner = tool.match(/\[([^\]]+)\]/)?.[1] ?? tool
+  const [client, version] = inner.split('/')
+  return version ? `${client} ${version}` : inner
+}
+
+/** Copy control small enough to live inside a chip. */
+function CopyIconButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false)
+  return (
+    <button
+      onClick={async (e) => {
+        e.stopPropagation()
+        await navigator.clipboard.writeText(text)
+        setCopied(true)
+        setTimeout(() => setCopied(false), 2000)
+      }}
+      title={`Copy the ${label}`}
+      className="shrink-0 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-200"
+    >
+      {copied ? <CheckIcon className="size-3" /> : <CopyIcon className="size-3" />}
+    </button>
+  )
+}
+
+/** One metadata fact: a muted label and its value, as a chip. */
+function MetaChip({ label, value, title, href, copy }: {
+  label: string
+  value: string
+  title?: string
+  /** Turns the chip into a link. */
+  href?: string
+  /** Text a copy control puts on the clipboard. */
+  copy?: string
+}) {
+  const className = 'inline-flex max-w-full items-center gap-1.5 rounded-xs bg-gray-100 px-2 py-1 text-xs/5 dark:bg-gray-700/60'
+  const body = (
+    <>
+      <span className="shrink-0 text-gray-500 dark:text-gray-400">{label}</span>
+      <span className={clsx('truncate font-mono', href ? 'text-blue-600 dark:text-blue-400' : 'text-gray-800 dark:text-gray-100')}>{value}</span>
+      {href && <ExternalLink className="size-3 shrink-0 text-gray-400 dark:text-gray-500" />}
+    </>
+  )
+  if (href) {
+    return (
+      <a
+        href={href}
+        target="_blank"
+        rel="noopener noreferrer"
+        title={title ?? href}
+        onClick={(e) => e.stopPropagation()}
+        className={clsx(className, 'hover:bg-gray-200 dark:hover:bg-gray-600')}
+      >
+        {body}
+      </a>
+    )
+  }
+  return (
+    <span title={title ?? value} className={className}>
+      {body}
+      {copy && <CopyIconButton text={copy} label={label} />}
+    </span>
+  )
+}
+
+// EEST fixture info and opcode counts. The prose leads, the facts follow
+// as chips, and the opcode charts close the panel.
 export function EESTInfoContent({ test, opcodeSort, onOpcodeSortChange }: { test: SuiteTest; opcodeSort: OpcodeSortMode; onOpcodeSortChange: (sort: OpcodeSortMode) => void }) {
   const info = test.eest?.info
   const opcodes = test.opcode_count ?? info?.opcode_count
+  const hasOpcodes = !!opcodes && Object.keys(opcodes).length > 0
 
-  const fields = info ? [
-    { label: 'Description', value: info.description },
-    { label: 'Comment', value: info.comment },
-    { label: 'Fixture Format', value: info['fixture-format'] },
-    { label: 'Filling Tool', value: info['filling-transition-tool'] },
-    { label: 'Hash', value: info.hash },
-    { label: 'URL', value: info.url },
-  ].filter((f) => f.value) : []
+  const tool = info?.['filling-transition-tool']
+  const fork = tool?.match(/fork=([^\];,\s]+)/)?.[1]
+  const hasProse = !!(info?.description || info?.comment)
+  const hasFacts = !!(info?.['fixture-format'] || tool || info?.hash || info?.url)
 
-  const hasOpcodes = opcodes && Object.keys(opcodes).length > 0
-
-  if (fields.length === 0 && !hasOpcodes) return null
+  if (!hasProse && !hasFacts && !hasOpcodes) return null
 
   return (
     <div className="flex flex-col gap-3">
       <div className="flex items-center gap-2">
         <Badge variant="default">{info ? 'EEST Info' : 'Opcode Info'}</Badge>
       </div>
-      <div className="rounded-sm border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
-        <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2 text-sm/6">
-          {fields.map(({ label, value }) => (
-            <Fragment key={label}>
-              <dt className="font-medium text-gray-500 dark:text-gray-400">{label}</dt>
-              <dd className="break-all text-gray-900 dark:text-gray-100">
-                {label === 'URL' && value ? (
-                  <a
-                    href={value}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-600 hover:underline dark:text-blue-400"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    {value}
-                  </a>
-                ) : (
-                  <span className="font-mono">{value}</span>
-                )}
-              </dd>
-            </Fragment>
+      <div className="flex flex-col gap-3 rounded-sm border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-800">
+        {hasProse && (
+          <div className="flex flex-col gap-1">
+            {info?.description && <p className="text-sm/6 text-gray-800 dark:text-gray-100">{info.description}</p>}
+            {info?.comment && <p className="text-xs/5 text-gray-500 dark:text-gray-400">{info.comment}</p>}
+          </div>
+        )}
+        {hasFacts && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            {info?.['fixture-format'] && <MetaChip label="format" value={info['fixture-format']} />}
+            {fork && <MetaChip label="fork" value={fork} />}
+            {tool && <MetaChip label="filled by" value={fillingToolLabel(tool)} title={tool} />}
+            {info?.hash && <MetaChip label="hash" value={shortHash(info.hash)} title={info.hash} copy={info.hash} />}
+            {info?.url && <MetaChip label="source" value={sourceLabel(info.url)} href={info.url} />}
+          </div>
+        )}
+        {hasOpcodes && <OpcodeBreakdown opcodes={opcodes!} sort={opcodeSort} onSortChange={onOpcodeSortChange} />}
+      </div>
+    </div>
+  )
+}
+
+/** Follows the theme, so the category colours repaint on a theme switch. */
+function useDarkMode() {
+  const [isDark, setIsDark] = useState(() => document.documentElement.classList.contains('dark'))
+  useEffect(() => {
+    const observer = new MutationObserver(() => setIsDark(document.documentElement.classList.contains('dark')))
+    observer.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
+    return () => observer.disconnect()
+  }, [])
+  return isDark
+}
+
+/**
+ * OpcodeBreakdown draws the opcode counts of a test: the mix per category
+ * on one stacked bar, and a bar per opcode behind a caret. Colour repeats
+ * the category of an opcode, and every mark carries its own label, so the
+ * chart never leans on colour alone.
+ */
+function OpcodeBreakdown({ opcodes, sort, onSortChange }: {
+  opcodes: Record<string, number>
+  sort: OpcodeSortMode
+  onSortChange: (sort: OpcodeSortMode) => void
+}) {
+  const isDark = useDarkMode()
+  const [showBars, setShowBars] = useState(false)
+
+  const entries = Object.entries(opcodes).filter(([, count]) => count > 0)
+  const total = entries.reduce((sum, [, count]) => sum + count, 0)
+  if (entries.length === 0 || total === 0) return null
+
+  const max = Math.max(...entries.map(([, count]) => count))
+  const bars = [...entries].sort(sort === 'name' ? ([a], [b]) => a.localeCompare(b) : ([, a], [, b]) => b - a)
+
+  // Category totals, largest first.
+  const perCategory = new Map<string, number>()
+  for (const [opcode, count] of entries) {
+    const category = getOpcodeCategory(opcode)
+    perCategory.set(category, (perCategory.get(category) ?? 0) + count)
+  }
+  const categories = [...perCategory.entries()].sort(([, a], [, b]) => b - a)
+  const share = (count: number) => (count / total) * 100
+  const fmtShare = (count: number) => `${share(count) >= 10 ? share(count).toFixed(0) : share(count).toFixed(1)}%`
+
+  return (
+    <div className="flex flex-col gap-3">
+      <span className="text-sm/6 font-medium text-gray-500 dark:text-gray-400">
+        Opcode Count{' '}
+        <span className="font-normal text-gray-400 dark:text-gray-500">
+          {total.toLocaleString()} calls over {entries.length} opcode{entries.length === 1 ? '' : 's'}
+        </span>
+      </span>
+
+      {/* The mix per category, one bar */}
+      <div className="flex flex-col gap-1.5">
+        <div className="flex h-3 w-full gap-0.5 overflow-hidden">
+          {categories.map(([name, count]) => (
+            <span
+              key={name}
+              className="h-full rounded-xs"
+              style={{ width: `${share(count)}%`, backgroundColor: getCategoryColor(name, isDark) }}
+              title={`${name}: ${count.toLocaleString()} (${fmtShare(count)})`}
+            />
           ))}
-        </dl>
-        {hasOpcodes && (
-          <div className="mt-3 flex flex-col gap-1">
-            <div className="flex items-center gap-2">
-              <span className="text-sm/6 font-medium text-gray-500 dark:text-gray-400">Opcode Count</span>
-              <button
-                onClick={() => onOpcodeSortChange(opcodeSort === 'name' ? 'count' : 'name')}
-                className="rounded-sm px-2 py-0.5 text-xs font-medium text-gray-500 hover:bg-gray-200 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-600 dark:hover:text-gray-200"
-              >
-                Sort by {opcodeSort === 'name' ? 'count' : 'name'}
-              </button>
-            </div>
-            <div className="flex flex-wrap gap-1">
-              {Object.entries(opcodes!)
-                .sort(opcodeSort === 'name'
-                  ? ([a], [b]) => a.localeCompare(b)
-                  : ([, a], [, b]) => b - a
-                )
-                .map(([opcode, count]) => {
-                  const category = getOpcodeCategory(opcode)
-                  return (
+        </div>
+        <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs/5 text-gray-500 dark:text-gray-400">
+          {categories.map(([name, count]) => (
+            <span key={name} className="inline-flex items-center gap-1.5">
+              <span className="size-2 shrink-0 rounded-xs" style={{ backgroundColor: getCategoryColor(name, isDark) }} />
+              {name}
+              <span className="text-gray-400 dark:text-gray-500">{fmtShare(count)}</span>
+            </span>
+          ))}
+        </div>
+      </div>
+
+      {/* One bar per opcode */}
+      <div className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <button
+            onClick={() => setShowBars((v) => !v)}
+            title={showBars ? 'Hide the opcodes' : 'Show a bar per opcode'}
+            className="flex items-center gap-1.5 text-xs font-medium text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200"
+          >
+            <span className={clsx('transition-transform', showBars && 'rotate-90')}>▶</span>
+            Every opcode ({entries.length})
+          </button>
+          {showBars && (
+            <button
+              onClick={() => onSortChange(sort === 'name' ? 'count' : 'name')}
+              className="rounded-sm px-2 py-0.5 text-xs font-medium text-gray-500 hover:bg-gray-200 hover:text-gray-700 dark:text-gray-400 dark:hover:bg-gray-600 dark:hover:text-gray-200"
+            >
+              Sort by {sort === 'name' ? 'count' : 'name'}
+            </button>
+          )}
+        </div>
+        {showBars && (
+          <div className="flex max-h-96 flex-col gap-1 overflow-y-auto pr-1">
+            {bars.map(([opcode, count]) => {
+              const category = getOpcodeCategory(opcode)
+              return (
+                <div key={opcode} className="flex items-center gap-2 text-xs/5" title={`${opcode} · ${category} · ${count.toLocaleString()} (${fmtShare(count)})`}>
+                  <span className="w-24 shrink-0 truncate text-right font-mono text-gray-700 dark:text-gray-200">{opcode}</span>
+                  <span className="relative h-2.5 flex-1 rounded-xs bg-gray-100 dark:bg-gray-700/60">
                     <span
-                      key={opcode}
-                      title={category}
-                      className="inline-flex items-center gap-1 rounded-xs bg-gray-100 px-2 py-0.5 font-mono text-xs/5 dark:bg-gray-700"
-                      style={{ color: getCategoryColor(category, document.documentElement.classList.contains('dark')) }}
-                    >
-                      {opcode}
-                      <span className="opacity-60">{count}</span>
-                    </span>
-                  )
-                })}
-            </div>
+                      className="absolute inset-y-0 left-0 rounded-xs"
+                      style={{ width: `${Math.max(1, (count / max) * 100)}%`, backgroundColor: getCategoryColor(category, isDark) }}
+                    />
+                  </span>
+                  <span className="w-28 shrink-0 text-right font-mono text-gray-600 dark:text-gray-300">
+                    {count.toLocaleString()}
+                    <span className="ml-1 text-gray-400 dark:text-gray-500">{fmtShare(count)}</span>
+                  </span>
+                </div>
+              )
+            })}
           </div>
         )}
       </div>
@@ -313,13 +472,19 @@ export function EESTInfoContent({ test, opcodeSort, onOpcodeSortChange }: { test
 // in that step plus a totals row. The three columns are the SSZ raw,
 // BAL, and snappy byte counts, each shown alongside its % of the SSZ
 // raw size for BAL/snappy rows.
-function PayloadSizesContent({ test }: { test: SuiteTest }) {
+export function PayloadSizesContent({ test, only, hideTitle }: {
+  test: SuiteTest
+  /** Limit the panel to one step. The default shows every populated step. */
+  only?: 'setup' | 'test' | 'cleanup'
+  /** Drop the "Payload Sizes" badge, for a caller that titles the panel itself. */
+  hideTitle?: boolean
+}) {
   const ps = test.payload_sizes
   if (!ps) return null
   const steps: { label: string; buckets: NonNullable<typeof ps.test> }[] = []
-  if (ps.setup) steps.push({ label: 'Setup', buckets: ps.setup })
-  if (ps.test) steps.push({ label: 'Test', buckets: ps.test })
-  if (ps.cleanup) steps.push({ label: 'Cleanup', buckets: ps.cleanup })
+  if (ps.setup && (!only || only === 'setup')) steps.push({ label: 'Setup', buckets: ps.setup })
+  if (ps.test && (!only || only === 'test')) steps.push({ label: 'Test', buckets: ps.test })
+  if (ps.cleanup && (!only || only === 'cleanup')) steps.push({ label: 'Cleanup', buckets: ps.cleanup })
   if (steps.length === 0) return null
 
   const pctCell = (numerator: number, denom: number) => {
@@ -333,10 +498,12 @@ function PayloadSizesContent({ test }: { test: SuiteTest }) {
 
   return (
     <div className="flex flex-col gap-3">
-      <div className="flex items-center gap-2">
-        <Badge variant="default">Payload Sizes</Badge>
-        <span className="text-xs/5 text-gray-500 dark:text-gray-400">per engine_newPayload</span>
-      </div>
+      {!hideTitle && (
+        <div className="flex items-center gap-2">
+          <Badge variant="default">Payload Sizes</Badge>
+          <span className="text-xs/5 text-gray-500 dark:text-gray-400">per engine_newPayload</span>
+        </div>
+      )}
       <div className="flex flex-col gap-4">
         {steps.map(({ label, buckets }) => {
           const n = Math.max(
@@ -532,7 +699,7 @@ export function TestFilesList({
   onSearchChange,
   detailIndex,
   onDetailChange,
-  opcodeSort = 'name',
+  opcodeSort = 'count',
   onOpcodeSortChange,
   testView,
   onTestViewChange,
