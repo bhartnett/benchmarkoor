@@ -278,9 +278,9 @@ jobs:
                   extra_args: [--p2p-enabled=true]
                 - id: nimbus
                   client: nimbus
-                  # The first nimbus-eth1 build that reads state-actor's Aristo
-                  # format; the same pin as state-actor's nimbus e2e suite.
-                  image: statusim/nimbus-eth1:master-2f0ae87
+                  # state-actor's Aristo format needs a nimbus-eth1 master
+                  # build from commit 2f0ae87 onwards; no release reads it yet.
+                  image: statusim/nimbus-eth1:master
                   # nimbus-genesis.json carries an empty alloc, so skip nimbus's
                   # rebuild-genesis-and-compare check on the snapshot datadir.
                   extra_args: [--debug-rewrite-datadir-id]
@@ -289,8 +289,8 @@ jobs:
   # snapshot, the pre_runs builder advances it (a tiny test_setup_contracts fill
   # via the besu filler — deploying a handful of receiver contracts and recording
   # a replay bundle), eest_payloads fills the bloatnet account-access benchmark on
-  # that ADVANCED datadir, then the runner replays those fixtures on besu and on
-  # geth. A 256 MB snapshot keeps it within a GitHub-hosted runner.
+  # that ADVANCED datadir, then the runner replays those fixtures on besu, geth,
+  # erigon and nimbus. A 256 MB snapshot keeps it within a GitHub-hosted runner.
   #
   # Both fills target AMSTERDAM: test_setup_contracts is valid_from("Amsterdam"),
   # so an osaka fill selects no tests at all. The snapshot itself stays osaka and
@@ -334,6 +334,7 @@ jobs:
                   besu: ghcr.io/ethereum/state-actor-besu:main
                   geth: ghcr.io/ethereum/state-actor:main
                   erigon: ghcr.io/ethereum/state-actor-erigon:main
+                  nimbus: ghcr.io/ethereum/state-actor-nimbus:main
                 pull_policy: always
                 config:
                   seed: 1234
@@ -374,14 +375,16 @@ jobs:
                 targets:
                   - client: besu
                     output_dir: /tmp/benchmarkoor/state-actor/besu
-                  # Same seed + spec, so geth's and erigon's snapshots carry the
-                  # same state as besu's. The db-compaction steps below boot each
+                  # Same seed + spec, so geth's, erigon's and nimbus's snapshots
+                  # carry the same state as besu's. The later run steps boot each
                   # on its own snapshot and replay besu's pre-run bundle to reach
                   # the same setup head.
                   - client: geth
                     output_dir: /tmp/benchmarkoor/state-actor/geth
                   - client: erigon
                     output_dir: /tmp/benchmarkoor/state-actor/erigon
+                  - client: nimbus
+                    output_dir: /tmp/benchmarkoor/state-actor/nimbus
               # Advance the snapshot: boot besu, run a tiny setup fill (with
               # fill-stateful --no-reset-between-tests, so the deployed contracts
               # persist), and record a replay bundle under the output_dir.
@@ -628,3 +631,55 @@ jobs:
                   # geth reads the genesis from the datadir, so the fork
                   # schedule comes from the flag rather than a genesis override.
                   extra_args: [--override.amsterdam=1]
+
+      # Same fixtures and the same pre-run bundle as the besu step above, on
+      # nimbus. Like geth and erigon, nimbus cannot boot besu's datadir, so it
+      # boots its OWN raw snapshot and replays besu's recorded bundle to reach
+      # the setup head. No db_compaction: benchmarkoor has no offline compaction
+      # command for nimbus.
+      - name: Run benchmarks (nimbus)
+        uses: ./
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          git-ref: ${{ github.event.pull_request.head.sha }}
+          git-repo: ${{ github.event.pull_request.head.repo.clone_url }}
+          mode: run
+          run-config-urls: >-
+            https://raw.githubusercontent.com/${{ github.event.pull_request.head.repo.full_name }}/${{ github.event.pull_request.head.sha }}/.github/workflows/config/benchmarkoor-global-cleanup.yaml,
+            https://raw.githubusercontent.com/${{ github.event.pull_request.head.repo.full_name }}/${{ github.event.pull_request.head.sha }}/.github/workflows/config/benchmarkoor-global-clientstdout.yaml
+          run-config: |
+            runner:
+              benchmark:
+                tests:
+                  source:
+                    eest_fixtures:
+                      local_fixtures_dir: /tmp/benchmarkoor/eest-fixtures/besu
+                      fixtures_subdir: blockchain_tests_stateful_engine
+                      # Replay besu's recorded pre-run bundle on nimbus's raw
+                      # snapshot; fixtures_subdir defaults to "pre_run_bundle".
+                      pre_runs:
+                        local_fixtures_dir: /tmp/benchmarkoor/pre-runs/besu
+              client:
+                config:
+                  bootstrap_fcu:
+                    enabled: true
+                    max_retries: 10
+                    backoff: 1s
+                  genesis:
+                    nimbus: /tmp/benchmarkoor/state-actor/nimbus/nimbus-genesis.json
+                datadirs:
+                  nimbus:
+                    source_dir: /tmp/benchmarkoor/state-actor/nimbus
+                    method: copy
+              instances:
+                - id: nimbus
+                  client: nimbus
+                  # state-actor's Aristo format needs a nimbus-eth1 master
+                  # build from commit 2f0ae87 onwards; no release reads it yet.
+                  image: statusim/nimbus-eth1:master
+                  # nimbus reads forks from its genesis (--network), so the same
+                  # amsterdam schedule as besu is patched in at boot.
+                  genesis_fork_override: { amsterdam: 1 }
+                  # nimbus-genesis.json carries an empty alloc, so skip nimbus's
+                  # rebuild-genesis-and-compare check on the snapshot datadir.
+                  extra_args: [--debug-rewrite-datadir-id]

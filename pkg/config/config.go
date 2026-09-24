@@ -454,7 +454,7 @@ type EESTPayloadTarget struct {
 	// GenesisForkOverride / GenesisEIPOverride patch the Genesis at filler boot
 	// to activate a fork the file doesn't schedule (e.g. amsterdam on an osaka
 	// snapshot), identically to the runner. GenesisForkOverride sets
-	// config.<fork>Time in a geth-format genesis (besu/reth/ethrex);
+	// config.<fork>Time in a geth-format genesis (besu/reth/ethrex/nimbus);
 	// GenesisEIPOverride sets params.eip<N>TransitionTimestamp in a parity
 	// chainspec (nethermind).
 	GenesisForkOverride map[string]uint64   `yaml:"genesis_fork_override,omitempty" mapstructure:"genesis_fork_override"`

@@ -1509,7 +1509,7 @@ These options let an instance activate a fork that is not scheduled in the genes
 
 Use these only for clients that read their fork schedule from the genesis file. **geth and erigon do not** — they read the fork schedule from the datadir, so a patched genesis is ignored. For those, use the client's own fork-override flag instead (e.g. `--override.amsterdam=<timestamp>` in `extra_args`).
 
-**`genesis_fork_override`** — for geth-format genesis files (besu, reth, ethrex). A map of fork name to activation timestamp. For each entry it sets `config.<fork>Time`, and if the genesis has a `blobSchedule` that lacks the fork, it inherits the schedule of the latest preceding fork (so the new fork carries a blob schedule, as geth-family clients require).
+**`genesis_fork_override`** — for geth-format genesis files (besu, reth, ethrex, nimbus). A map of fork name to activation timestamp. For each entry it sets `config.<fork>Time`, and if the genesis has a `blobSchedule` that lacks the fork, it inherits the schedule of the latest preceding fork (so the new fork carries a blob schedule, as geth-family clients require).
 
 ```yaml
 runner:
@@ -1893,7 +1893,7 @@ The fields below mirror `builder.state_actor.config`; any field set here overrid
 | `binary_trie` | bool | from `config`, then `false` | geth | EIP-7864 binary trie. Set `false` to opt out of a global default. Rejected (after resolution) for non-geth. |
 | `group_depth` | int | from `config`, then `8` (state-actor) | geth + binary_trie | Binary-trie serialisation unit. Range 1..8. Requires effective `binary_trie=true`. |
 
-State-actor itself only writes the genesis block; subsequent blocks come from running a client against the produced datadir. See [state-actor RUNBOOK.md](https://github.com/ethereum/state-actor/blob/main/docs/RUNBOOK.md) for the per-client boot recipes (e.g. geth needs `--db.engine=pebble`; reth needs `--debug.skip-genesis-validation`; besu needs `--data-storage-format=BONSAI`; ethrex needs `--skip-genesis-validation` and ≥ v16.0.0; nimbus needs `--debug-rewrite-datadir-id`, the emitted `nimbus-genesis.json` as its genesis, and a `statusim/nimbus-eth1` build at or after `master-2f0ae87`, the first to read state-actor's on-disk format).
+State-actor itself only writes the genesis block; subsequent blocks come from running a client against the produced datadir. See [state-actor RUNBOOK.md](https://github.com/ethereum/state-actor/blob/main/docs/RUNBOOK.md) for the per-client boot recipes (e.g. geth needs `--db.engine=pebble`; reth needs `--debug.skip-genesis-validation`; besu needs `--data-storage-format=BONSAI`; ethrex needs `--skip-genesis-validation` and ≥ v16.0.0; nimbus needs `--debug-rewrite-datadir-id`, the emitted `nimbus-genesis.json` as its genesis, and a `statusim/nimbus-eth1:master` build from commit `2f0ae87` onwards, the first to read state-actor's on-disk format).
 
 ### Running
 
@@ -2015,7 +2015,7 @@ builder:
 4. Runs `fill-stateful --no-reset-between-tests` on the configured setup `tests`, so deployed state persists across them.
 5. Writes `<bundle_dir>/pre_run_bundle/pre-run.request` plus a `pre-run.meta.json` sidecar describing it.
 
-Only `geth`, `besu` and `nethermind` can act as the filler. A target with `replay_from` set instead *consumes* a bundle: it boots any client (including non-fillers like reth/ethrex, since replay only needs the engine API) and replays the recorded payloads onto its own snapshot.
+Only `geth`, `besu` and `nethermind` can act as the filler. A target with `replay_from` set instead *consumes* a bundle: it boots any client (including non-fillers like reth/ethrex/nimbus, since replay only needs the engine API) and replays the recorded payloads onto its own snapshot.
 
 ```yaml
 builder:
@@ -2189,7 +2189,7 @@ Identity/locator fields are target-only; the rest mirror `config` and are resolv
 | `filler_client` | string | – | Client booted as the filler: `geth`, `nethermind`, or `besu` (all implement `testing_buildBlockV1`). |
 | `source_dir` | string | – | **Absolute** host path to the pristine snapshot datadir (e.g. a `state_actor` `output_dir`). Never mutated — a writable copy is filled. Existence is checked at build time. |
 | `genesis` | string | – | **Absolute** host path to the genesis/chainspec the filler boots with (besu/nethermind read their fork schedule from it; passed via the client's genesis flag). Must match the chain config used to produce `source_dir`. geth/erigon boot from the datadir instead and need no `genesis`. |
-| `genesis_fork_override` | map | – | Patch the geth-format `genesis` at filler boot to activate forks at given timestamps (`{amsterdam: 1}` → `config.amsterdamTime`, inheriting the blob schedule). For besu/reth/ethrex fillers. Same mechanism as the runner. Requires `genesis`. |
+| `genesis_fork_override` | map | – | Patch the geth-format `genesis` at filler boot to activate forks at given timestamps (`{amsterdam: 1}` → `config.amsterdamTime`, inheriting the blob schedule). For besu/reth/ethrex/nimbus fillers. Same mechanism as the runner. Requires `genesis`. |
 | `genesis_eip_override` | object | – | Patch a parity/nethermind `genesis` at filler boot, setting `params.eip<N>TransitionTimestamp` for each listed EIP. Fields: `timestamp` (uint), `eips` ([]uint). For the nethermind filler. Requires `genesis`; mutually exclusive with `genesis_fork_override`. |
 | `output_dir` | string | – | **Absolute** host path for the generated fixtures. Skipped if already populated unless `--force` / `force: true`. Written under `<output_dir>/blockchain_tests_stateful_engine/`. |
 | `force` | bool | `false` | Per-target override of `--force`: wipe `output_dir` before filling. |
