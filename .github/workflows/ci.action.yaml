@@ -140,10 +140,12 @@ jobs:
                   client: reth
 
   # Exercises the builder pipeline end-to-end: state-actor builds OSAKA
-  # snapshots for nethermind + besu, the eest_payloads builder fills the
-  # compute "bn128" subset with the besu filler, then the runner replays
-  # those fixtures on nethermind and besu. datadir_method: copy + a small
-  # 256 MB snapshot keep it within a GitHub-hosted runner.
+  # snapshots for nethermind + besu + nimbus, the eest_payloads builder fills
+  # the compute "bn128" subset with the besu filler, then the runner replays
+  # those fixtures on nethermind, besu and nimbus. Same seed + spec gives every
+  # snapshot the same genesis, so besu's fixtures apply to all three.
+  # datadir_method: copy + a small 256 MB snapshot keep it within a
+  # GitHub-hosted runner.
   state-actor:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -160,7 +162,7 @@ jobs:
             /opt/hostedtoolcache/CodeQL /usr/share/dotnet /usr/local/share/boost
           df -h /
 
-      - name: Build snapshots + fill payloads (nethermind + besu)
+      - name: Build snapshots + fill payloads (nethermind + besu + nimbus)
         uses: ./
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -175,6 +177,7 @@ jobs:
                 images:
                   nethermind: ghcr.io/ethereum/state-actor-nethermind:main
                   besu: ghcr.io/ethereum/state-actor-besu:main
+                  nimbus: ghcr.io/ethereum/state-actor-nimbus:main
                 pull_policy: always
                 config:
                   seed: 1234
@@ -202,6 +205,8 @@ jobs:
                     output_dir: /tmp/benchmarkoor/state-actor/nethermind
                   - client: besu
                     output_dir: /tmp/benchmarkoor/state-actor/besu
+                  - client: nimbus
+                    output_dir: /tmp/benchmarkoor/state-actor/nimbus
               eest_payloads:
                 # Fill image is built from the Dockerfile embedded in the binary.
                 pull_policy: always
@@ -224,7 +229,7 @@ jobs:
                     genesis: /tmp/benchmarkoor/state-actor/besu/besu-chainspec.json
                     output_dir: /tmp/benchmarkoor/eest-fixtures/besu
 
-      - name: Run benchmarks (nethermind + besu)
+      - name: Run benchmarks (nethermind + besu + nimbus)
         uses: ./
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -251,12 +256,16 @@ jobs:
                   genesis:
                     nethermind: /tmp/benchmarkoor/state-actor/nethermind/parity-chainspec.json
                     besu: /tmp/benchmarkoor/state-actor/besu/besu-chainspec.json
+                    nimbus: /tmp/benchmarkoor/state-actor/nimbus/nimbus-genesis.json
                 datadirs:
                   nethermind:
                     source_dir: /tmp/benchmarkoor/state-actor/nethermind
                     method: copy
                   besu:
                     source_dir: /tmp/benchmarkoor/state-actor/besu
+                    method: copy
+                  nimbus:
+                    source_dir: /tmp/benchmarkoor/state-actor/nimbus
                     method: copy
               instances:
                 - id: nethermind
@@ -267,6 +276,14 @@ jobs:
                   client: besu
                   image: ethpandaops/besu:glamsterdam-devnet-8
                   extra_args: [--p2p-enabled=true]
+                - id: nimbus
+                  client: nimbus
+                  # The first nimbus-eth1 build that reads state-actor's Aristo
+                  # format; the same pin as state-actor's nimbus e2e suite.
+                  image: statusim/nimbus-eth1:master-2f0ae87
+                  # nimbus-genesis.json carries an empty alloc, so skip nimbus's
+                  # rebuild-genesis-and-compare check on the snapshot datadir.
+                  extra_args: [--debug-rewrite-datadir-id]
 
   # Exercises the pre_runs builder end-to-end: state-actor builds an OSAKA besu
   # snapshot, the pre_runs builder advances it (a tiny test_setup_contracts fill
