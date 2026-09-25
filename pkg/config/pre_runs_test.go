@@ -571,10 +571,9 @@ func TestLoad_PreRunsExampleConfig(t *testing.T) {
 	require.NoError(t, cfg.ValidateBuilder())
 
 	require.NotNil(t, cfg.Builder.PreRuns)
-	// nethermind fills; geth/besu/reth/ethrex/nimbus advance by replaying its
-	// bundle (replay_from), so the runner boots every client from its own
-	// advanced datadir.
-	require.Len(t, cfg.Builder.PreRuns.Targets, 6)
+	// nethermind fills; geth/besu/reth/ethrex advance by replaying its bundle
+	// (replay_from), so the runner boots every client from its own advanced datadir.
+	require.Len(t, cfg.Builder.PreRuns.Targets, 5)
 
 	nm := cfg.Builder.PreRuns.ResolveTarget(0)
 	assert.Equal(t, "nethermind", nm.FillerClient)
