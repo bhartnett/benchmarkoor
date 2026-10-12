@@ -1148,6 +1148,18 @@ Only clients that ship an offline compaction command support this. Today that is
 
 > **On erigon, `before_benchmarks` needs `--exec.no-prune` on the instance.** That phase stops and restarts the client, and erigon refuses to reopen a datadir whose receipt domain it pruned past the snapshot files: `[snapshots] gap between snapshot files and DB for domain receipt: files end at txNum 0 but the DB was pruned up to 390625`. A synthetic snapshot has no snapshot files, so the client's own pruning is enough to create the gap. `--exec.no-prune` disables the state-aggregator pruning that advances the marker. Erigon documents the flag for diagnostic and perf-comparison use, which is what a benchmark is, and it removes housekeeping the benchmark does not want anyway. `before_pre_runs` needs no flag: it compacts before the client ever boots, so nothing restarts.
 
+###### Outside a run: `benchmarkoor db compact`
+
+Run the same client-provided maintenance commands against a stopped host datadir without a benchmark config:
+
+```bash
+benchmarkoor db compact --client geth --datadir /path/to/datadir --image ethereum/client-go:v1.17.7
+```
+
+Only Geth and Erigon are supported. Other clients return an error; benchmarkoor does not use generic database tools or replace database files itself. Select the image version that wrote the datadir with `--image`; the default is the client's default image. The client must be stopped before running this command.
+
+`--prepare`, `--extra-arg`, `--timeout` and `--no-inspect` use the same settings as a run's compaction phase. Container output goes to stdout. Preparation or compaction failures return a non-zero exit status; inspection failures remain warnings, as in a run. No run marker or report is written.
+
 ###### Preparation steps (`prepare`)
 
 A client can offer steps that run before the compaction to make it reclaim more. None run unless `prepare` names them, because a step that helps one datadir can ruin another.
