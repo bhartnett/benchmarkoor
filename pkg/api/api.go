@@ -57,11 +57,11 @@ type server struct {
 	trustedProxies []*net.IPNet
 	xffWarnOnce    sync.Once
 
-	// indexCache holds the marshaled /index response keyed by the runs-table
-	// generation, so repeated polls don't rebuild it. See handleIndex.
-	indexCacheMu   sync.Mutex
-	indexCacheGen  uint64
-	indexCacheBody []byte
+	// indexCache holds the rendered /index response (body, gzipped body and
+	// ETag) keyed by the runs-table generation, so repeated polls don't
+	// rebuild or re-encode it. See handleIndex.
+	indexCacheMu sync.Mutex
+	indexCache   *indexCacheEntry
 }
 
 // NewServer creates a new API server.
@@ -306,8 +306,13 @@ func (s *server) prepareIndexing(ctx context.Context) error {
 
 	// Create the indexer (not started yet).
 	s.indexer = indexer.NewIndexer(
-		s.log, s.indexStore, s.storageReader, interval,
-		s.cfg.Indexing.Concurrency,
+		s.log, s.indexStore, s.storageReader,
+		indexer.Options{
+			Interval:     interval,
+			Concurrency:  s.cfg.Indexing.Concurrency,
+			FailureGrace: s.cfg.Indexing.GetFailureGracePeriod(),
+			FailureRetry: s.cfg.Indexing.GetFailureRetryInterval(),
+		},
 		onLiveRunIndexed,
 	)
 

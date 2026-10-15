@@ -274,6 +274,8 @@ api:
     enabled: true
     interval: "10m"
     concurrency: 4
+    failure_grace_period: "6h"
+    failure_retry_interval: "24h"
     database:
       driver: sqlite
       sqlite:
@@ -285,6 +287,8 @@ api:
 | `enabled` | bool | `false` | Enable the background indexing service |
 | `interval` | string | `10m` | How often to re-scan storage for new/updated runs (Go duration string) |
 | `concurrency` | int | `4` | Number of runs to index in parallel. Higher values speed up indexing but increase I/O and memory usage. Set to `1` for sequential processing |
+| `failure_grace_period` | string | `6h` | How old a run must be before a failed index is recorded against it. See [Failed runs](#failed-runs) |
+| `failure_retry_interval` | string | `24h` | How long a recorded failure is skipped for before the indexer tries it again |
 | `database.driver` | string | Required | Database driver (`sqlite` or `postgres`). This is a **separate** database from the auth database |
 | `database.sqlite.path` | string | When driver=sqlite | Path to the index SQLite database file |
 | `database.postgres.*` | - | When driver=postgres | PostgreSQL connection settings (same schema as the [auth database](#postgresql)) |
@@ -328,6 +332,86 @@ While a run is queued, it stays visible:
 Queuing a run that is already queued is a no-op. A run whose status is `running` is refused with a per-run error, because deleting it would race with the active runner. Deletion needs a storage backend that supports deletion (both S3 and local do).
 
 To take a run out of the queue, call `POST /admin/runs/delete/cancel` with the same `run_ids` body. This clears the mark and the recorded error. Use it when a run fails to delete again and again, for example when its discovery path was removed from the storage config. The cancel is best-effort: a run the worker is deleting at that moment is still removed.
+
+#### Deleting a whole suite
+
+`POST /admin/runs/delete` also takes `suite_hashes`, which queues every run of the named suites. A suite can hold thousands of runs, so the server resolves them rather than making the client send every ID.
+
+```json
+{"suite_hashes": ["22c2404b9ce3f47c"]}
+```
+
+The same guard applies per run: a run that is still `running` is left alone, and the response says how many were skipped for that reason. Runs that were already queued are reported too, so a repeat request explains why it queued nothing rather than returning a bare `queued: 0`. Deleting the last run of a suite also removes the suite row, because `DeleteRunCascade` cleans up an orphaned suite.
+
+At most 200 suites per request. Each one costs a transaction on the SQLite writer, which is a single connection, so an unbounded list would hold that connection — and the indexer behind it — for as long as the list.
+
+In the UI this is the trash button on the **Suites** page. It turns on a checkbox per suite and a bar showing how many runs the selection will queue.
+
+### Database report
+
+`GET /admin/database` reports the size and contents of the index database, so an admin can tell whether a cleanup is due before the volume fills up. It backs the **Admin → Database** tab.
+
+It returns:
+
+- The database file size, its write-ahead log, and the page count.
+- `free_pages * page_size`, which is what a `VACUUM` would hand back. Note that a `VACUUM` needs as much free space again as the database occupies, so it is not a way out of a nearly full volume.
+- The size of the filesystem holding the database, what files occupy on it, and what is still available. Used and available add up to less than the total, because a filesystem reserves a slice for root: a usage share is `used/(used+available)`, the way `df` computes it. Dividing by the total instead would read the deployed volume as 88% full where `df` says 93%, and an empty ext4 volume as 5% full.
+- A row count per table. The per-test tables, `test_stats` and `test_stats_block_logs`, get an estimate with `estimated: true` (see below).
+- The suites with the most runs, with `tests`: the sum of `tests_total` over each suite's runs. This is about the number of `test_stats` rows that deleting the suite's runs removes. This pairs with deleting a suite's runs above.
+
+The API builds the report on each request, and the report uses only cheap queries. The per-test tables hold tens of millions of rows in production, and one `COUNT(*)` on `test_stats` ran for more than 30 minutes. So the report never counts or groups them:
+
+- Their row count is `MAX(id) - MIN(id) + 1`. Each end is one index lookup. It is an upper bound, because a delete in the middle of the ID range does not lower it.
+- The per-suite figures come from the `runs` table only, which has one row per run.
+
+The request has a 30s timeout, so a slow query shows up as a failed request. `gathered_at` says when the figures were taken.
+
+Per-table byte sizes are **not** reported. The SQLite build used here has no `dbstat` virtual table, and an estimate would be worse than an honest omission.
+
+### Pass history
+
+The indexer writes a row when a pass ends, and `GET /admin/indexer/stats` returns the most recent ones, newest first. It backs the charts under **Admin → Indexer**, which is where a pass getting slower shows up before it gets slow enough to notice.
+
+Each row carries how long the pass took, what started it (`startup`, `schedule` or `manual`), and what it did: runs added, incomplete runs read again, runs it could not index, and runs it skipped because their failure record is still muted. It also carries what storage held and how much of that the index already had, so the backlog a pass started with is visible. A pass a shutdown cut short has status `cancelled`, whether the shutdown landed between two discovery paths or inside one, and its counters cover only the work it got through. Runs whose reads the shutdown cancelled are left out of `runs_failed` and earn no failure record, because the shutdown says nothing about the run.
+
+The table keeps the last 500 passes. A deployment on a one-minute interval writes a row a minute, so the oldest rows are pruned on every write.
+
+A pass in flight has no row yet. The same endpoint reports it separately:
+
+```json
+{
+  "running": true,
+  "current_pass": {
+    "started_at": "2026-09-25T18:20:00Z",
+    "trigger": "manual",
+    "elapsed_ms": 137000
+  },
+  "interval": "10m0s"
+}
+```
+
+`elapsed_ms` is measured on the server, so a browser with a skewed clock still shows the right elapsed time. The UI uses it to say how long the pass has been going, and to leave the **Run Indexer** button disabled while it is — starting a second pass would only be refused with 409.
+
+### Failed runs
+
+A run directory that storage holds but the indexer cannot read leaves nothing behind on its own. Most of them never got their `config.json`, because the upload died part-way. Without a record the indexer re-reads every one of them on every pass: on one deployment that was 9779 storage round-trips and 9779 log lines per pass, and it was most of why a pass took 26 minutes.
+
+The indexer therefore records these runs in an `index_failures` table.
+
+1. A run that fails to index is only recorded once it is older than `failure_grace_period` (default 6h). Below that age a missing `config.json` means the upload is still in flight, not that the run is broken. A run's age comes from its ID, which is named `{timestamp}_{shortID}_{instance}` — the run has no `config.json`, so the ID is the only place a timestamp survives.
+2. A recorded run is skipped by later passes until `failure_retry_interval` (default 24h) lapses. The pass does not read it from storage at all.
+3. When the interval lapses the run is tried again. A run whose upload finally landed is indexed and loses its record, so a late upload heals without anyone intervening.
+4. A record whose run has left storage is dropped on the next pass.
+
+The first failure is logged at `warn`. Repeats drop to `debug`, because the record is the durable signal.
+
+Admins see the records under **Admin → Indexer** in the UI, or through the API:
+
+- `GET /admin/indexer/failures` lists them, newest run first, paged.
+- `POST /admin/indexer/failures/delete` queues runs so their stored data is deleted. Pass `run_ids` for a chosen set or `all` for every record.
+- `POST /admin/indexer/failures/delete/cancel` takes them back out of the queue.
+
+Deletion uses the same background worker as run deletion. The files go from storage first; the record is dropped only once that succeeds. A record whose delete fails keeps its place in the queue with the reason attached, and is retried on the next pass.
 
 ## Ingest (live run reporting)
 
@@ -396,6 +480,7 @@ A request whose `Content-Length` exceeds the limit is rejected with `413 Payload
 | `POST` | `/admin/github/user-mappings` | Create/update user mapping |
 | `DELETE` | `/admin/github/user-mappings/{id}` | Delete user mapping |
 | `POST` | `/admin/indexer/run` | Trigger an immediate indexing pass. Returns 409 if already running. Requires [indexing](#indexing) to be enabled |
+| `GET` | `/admin/indexer/stats` | The recent indexing passes and the pass running right now. Requires [indexing](#indexing) to be enabled. See [Pass history](#pass-history) |
 | `POST` | `/admin/runs/delete` | Queue runs for deletion. Returns 202 as soon as the runs are marked. Requires [indexing](#indexing) to be enabled. See [Run deletion](#run-deletion) |
 | `POST` | `/admin/runs/delete/cancel` | Take runs out of the deletion queue. Requires [indexing](#indexing) to be enabled |
 | `GET` | `/admin/runs/deletion-queue` | List the runs queued for deletion, in deletion order. Requires [indexing](#indexing) to be enabled |
@@ -459,6 +544,8 @@ API configuration values can be overridden via environment variables with the `B
 | `api.indexing.enabled` | `BENCHMARKOOR_API_INDEXING_ENABLED` |
 | `api.indexing.interval` | `BENCHMARKOOR_API_INDEXING_INTERVAL` |
 | `api.indexing.concurrency` | `BENCHMARKOOR_API_INDEXING_CONCURRENCY` |
+| `api.indexing.failure_grace_period` | `BENCHMARKOOR_API_INDEXING_FAILURE_GRACE_PERIOD` |
+| `api.indexing.failure_retry_interval` | `BENCHMARKOOR_API_INDEXING_FAILURE_RETRY_INTERVAL` |
 | `api.indexing.database.driver` | `BENCHMARKOOR_API_INDEXING_DATABASE_DRIVER` |
 | `api.indexing.database.sqlite.path` | `BENCHMARKOOR_API_INDEXING_DATABASE_SQLITE_PATH` |
 

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/ethpandaops/benchmarkoor/pkg/blockdev"
 	"github.com/ethpandaops/benchmarkoor/pkg/cputopology"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -200,6 +201,50 @@ func TestCollectFailedTests(t *testing.T) {
 	})
 }
 
+func TestCollectRejectedTests(t *testing.T) {
+	assert.Nil(t, collectRejectedTests(nil))
+
+	result := &RunResult{
+		Tests: map[string]*TestEntry{
+			"valid": {
+				Steps: &StepsResult{
+					Test: &StepResult{Aggregated: &AggregatedStats{Succeeded: 1}},
+				},
+			},
+			"zz_invalid": {
+				Steps: &StepsResult{
+					Test: &StepResult{Aggregated: &AggregatedStats{
+						Succeeded: 1, Rejected: 1, RejectedTimeTotal: 61_000_000,
+					}},
+				},
+			},
+			"aa_invalid": {
+				Steps: &StepsResult{
+					Test: &StepResult{Aggregated: &AggregatedStats{
+						Succeeded: 2, Rejected: 2, RejectedTimeTotal: 2_000_000_000,
+					}},
+				},
+			},
+		},
+	}
+
+	rejected := collectRejectedTests(result)
+	require.Len(t, rejected, 2)
+	assert.Equal(t, rejectedTestInfo{Name: "aa_invalid", Payloads: 2, DurationNs: 2_000_000_000}, rejected[0])
+	assert.Equal(t, "zz_invalid", rejected[1].Name)
+
+	var sb strings.Builder
+
+	writeRejectedTests(&sb, rejected, 0)
+	assert.Contains(t, sb.String(), "## Rejected Payloads")
+	assert.Contains(t, sb.String(), "| aa_invalid | 2 | 2s |")
+	assert.Contains(t, sb.String(), "| zz_invalid | 1 | 61ms |")
+
+	sb.Reset()
+	writeRejectedTests(&sb, rejected, 1)
+	assert.Contains(t, sb.String(), "*2 more rejected test(s) not shown")
+}
+
 func TestGenerateRunMarkdown(t *testing.T) {
 	t.Run("full run with result", func(t *testing.T) {
 		dir := t.TempDir()
@@ -221,8 +266,17 @@ func TestGenerateRunMarkdown(t *testing.T) {
 		assert.Contains(t, md, "| CPU | AMD Ryzen 9 |")
 		assert.Contains(t, md, "| Threads | 32 |")
 		assert.Contains(t, md, "| CPU Layout | 32 threads on 16 physical cores (2 threads per core) |")
+		assert.Contains(t, md, "| Storage Device | /dev/nvme0n1 (nvme, Samsung SSD 990 PRO 4TB, 4.001TB) |")
+		assert.Contains(t, md, "| Filesystem | ext4 |")
+		assert.Contains(t, md, "| Disk Random 4K IOPS (75/25 mix) | 512346 read / 123457 write |")
+		assert.Contains(t, md, "| Disk Sequential (50/50 mix) | 7GiB/s read / 6GiB/s write |")
+		assert.Contains(t, md, "| Disk QD1 Random 4K IOPS | 14000 read (p99 95 µs) / 52000 write (p99 31 µs) |")
 		assert.Contains(t, md, "## Resource Limits")
 		assert.Contains(t, md, "| CPU Set | 0-3 |")
+		assert.Contains(t, md, "| Disk Device | /dev/nvme0n1 |")
+		assert.Contains(t, md, "| Disk Read IOPS | 50000 |")
+		assert.Contains(t, md, "| Disk Read Bandwidth | 500MiB/s |")
+		assert.NotContains(t, md, "Disk Write IOPS")
 		assert.Contains(t, md,
 			"| CPU Layout | 4 threads on 4 of 16 physical cores (1 of 2 threads per core) |")
 		assert.Contains(t, md, "## Metadata")
@@ -336,6 +390,25 @@ func writeFixtureConfig(t *testing.T, dir string) {
 			CPUMhz:        5756.0,
 			MemoryTotalGB: 64.0,
 			CPUTopology:   smtTopology(16),
+			Storage: &markdownStorage{
+				Filesystem: "ext4",
+				Device: &blockdev.Device{
+					Path:      "/dev/nvme0n1",
+					Kind:      "nvme",
+					Model:     "Samsung SSD 990 PRO 4TB",
+					SizeBytes: 4_000_787_030_016,
+				},
+				Probe: &blockdev.ProbeResult{
+					RandReadIOPS:    512345.6,
+					RandWriteIOPS:   123456.7,
+					SeqReadBps:      7 << 30,
+					SeqWriteBps:     6 << 30,
+					RandReadPercent: 75,
+					SeqReadPercent:  50,
+					QD1RandRead:     &blockdev.LatencyResult{IOPS: 14000, P50Us: 70, P99Us: 95},
+					QD1RandWrite:    &blockdev.LatencyResult{IOPS: 52000, P50Us: 18, P99Us: 31},
+				},
+			},
 		},
 		Instance: &markdownInstance{
 			ID:            "geth",
@@ -343,10 +416,13 @@ func writeFixtureConfig(t *testing.T, dir string) {
 			Image:         "ethpandaops/geth:latest",
 			ClientVersion: "Geth/v1.17.0",
 			ResourceLimits: &markdownResourceLimits{
-				CpusetCpus:    "0-3",
-				Memory:        "16g",
-				CPUFreqKHz:    &freqKHz,
-				CPUTurboBoost: &turbo,
+				CpusetCpus:     "0-3",
+				Memory:         "16g",
+				CPUFreqKHz:     &freqKHz,
+				CPUTurboBoost:  &turbo,
+				DevicePath:     "/dev/nvme0n1",
+				DeviceReadIOps: 50000,
+				DeviceReadBps:  500 << 20,
 			},
 		},
 		Metadata: &markdownMetadata{

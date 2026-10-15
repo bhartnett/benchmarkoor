@@ -46,6 +46,8 @@ export interface LiveTestStats {
   passed: boolean
   gas_used?: number
   gas_used_duration_ns?: number
+  // Time to reject of an invalid-payload benchmark (it has no gas).
+  rejected_duration_ns?: number
 }
 
 export interface IndexEntry {
@@ -265,6 +267,68 @@ export interface SystemInfo {
   cpu_cache_kb: number
   memory_total_gb: number
   cpu_topology?: CPUTopologyEntry[]
+  /** The block device that holds the client datadir (Linux only). */
+  storage?: StorageInfo
+}
+
+/** A block device, as read from sysfs. */
+export interface BlockDevice {
+  name: string
+  path: string
+  maj_min?: string
+  /** nvme, scsi, virtio, xen, mmc, device-mapper, md, loop, ramdisk or other. */
+  kind?: string
+  dm_name?: string
+  model?: string
+  vendor?: string
+  firmware?: string
+  size_bytes?: number
+  rotational?: boolean
+  scheduler?: string
+  logical_block_size?: number
+  physical_block_size?: number
+  nr_requests?: number
+  /** The physical disks under a device-mapper or md device. */
+  backing?: BlockDevice[]
+}
+
+/** The rate and the latency of a workload with one I/O in flight. */
+export interface StorageLatency {
+  iops: number
+  p50_us: number
+  p99_us: number
+}
+
+/** The measured capacity of the datadir device, outside any container. */
+export interface StorageProbe {
+  /** From one mixed run with rand_read_percent reads, when set. */
+  rand_read_iops: number
+  rand_write_iops: number
+  /** From one mixed run with seq_read_percent reads, when set. */
+  seq_read_bps: number
+  seq_write_bps: number
+  /** Share of reads in the mixed runs. Not set: separate read and write runs (older probe). */
+  rand_read_percent?: number
+  seq_read_percent?: number
+  /** 4 KiB random I/O with one I/O in flight. */
+  qd1_rand_read?: StorageLatency
+  qd1_rand_write?: StorageLatency
+  file_size_bytes: number
+  io_depth: number
+  duration: string
+  rand_block_size: number
+  seq_block_size: number
+}
+
+export interface StorageInfo {
+  data_path: string
+  filesystem?: string
+  partition?: string
+  device?: BlockDevice
+  /** Why the device is unknown. */
+  error?: string
+  probe?: StorageProbe
+  probe_error?: string
 }
 
 /** One logical CPU (hardware thread) and where it sits on the host. */
@@ -281,28 +345,25 @@ export interface DataDirConfig {
   method?: string
 }
 
-export interface ThrottleDeviceConfig {
-  path: string
-  rate: number
-}
-
-export interface BlkioConfig {
-  device_read_bps?: ThrottleDeviceConfig[]
-  device_read_iops?: ThrottleDeviceConfig[]
-  device_write_bps?: ThrottleDeviceConfig[]
-  device_write_iops?: ThrottleDeviceConfig[]
-}
-
 export interface ResourceLimitsConfig {
   cpuset_cpus?: string
   cpuset_topology?: 'full_cores' | 'one_thread_per_core'
   memory?: string
   memory_bytes?: number
   swap_disabled?: boolean
-  blkio_config?: BlkioConfig
   cpu_freq_khz?: number
   cpu_turboboost?: boolean
   cpu_freq_governor?: string
+  /** The datadir block device that the device_* limits throttle. */
+  device_path?: string
+  device_read_bps?: number
+  device_read_iops?: number
+  device_write_bps?: number
+  device_write_iops?: number
+  /** "io.cost" when the limits are an io.cost model of the whole disk. Absent for io.max. */
+  device_throttle?: string
+  /** The io.cost.model line that the run wrote. */
+  device_cost_model?: string
 }
 
 export interface RetryNewPayloadsSyncingConfig {
@@ -433,6 +494,10 @@ export interface AggregatedStats {
   time_total: number
   gas_used_total: number
   gas_used_time_total: number
+  // engine_newPayload calls the client rejected as the fixture expects, and
+  // their summed duration (the time to reject; there is no MGas/s for them).
+  rejected?: number
+  rejected_time_total?: number
   success: number
   fail: number
   msg_count: number
@@ -485,6 +550,7 @@ export interface ResultDetails {
   mgas_s: Record<string, number> // map of index -> MGas/s value
   gas_used: Record<string, number> // map of index -> gas used value
   resources?: Record<string, ResourceDelta> // map of index -> resource delta
+  rejected?: number[] // indexes of calls whose payload the client must reject
   original_test_name?: string // original test name when using hashed filenames
   filename_hash?: string // truncated+hash filename when original was too long
 }
@@ -503,6 +569,8 @@ export interface RunDuration {
   client: string
   gas_used: number
   time_ns: number
+  // Time the client took to reject the test's expected-invalid payloads.
+  rejected_time_ns?: number
   run_start: number
   run_end?: number
   steps?: RunDurationStepsStats
@@ -517,6 +585,7 @@ export interface RunDurationStepsStats {
 export interface RunDurationStepStats {
   gas_used: number
   time_ns: number
+  rejected_time_ns?: number
 }
 
 // summary.json per suite
@@ -535,6 +604,11 @@ export interface SuiteInfo {
 }
 
 export interface SuiteTestEEST {
+  /**
+   * Exceptions of the payloads the client must reject (e.g.
+   * "BlockException.INVALID_GAS_USED"). Set for an invalid-payload benchmark.
+   */
+  expected_rejections?: string[]
   info?: {
     'fixture-format': string
     hash?: string
@@ -550,6 +624,12 @@ export interface SuiteTestEEST {
        * aggregates these into the test's top-level opcode_count.
        */
       opcode_counts?: (Record<string, number> | null)[]
+      /**
+       * Gas the benchmark transactions use. Set for a fixture whose block the
+       * client must reject: such a block has no receipts, and its header
+       * gasUsed may be the corrupted field.
+       */
+      benchmark_gas_used?: number
     }
   }
 }

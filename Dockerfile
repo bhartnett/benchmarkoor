@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.24-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache git
 
@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 # Final stage
 FROM alpine:3.21
 
-RUN apk add --no-cache ca-certificates tzdata git zfs fuse-overlayfs rsync iptables iproute2 && \
+RUN apk add --no-cache ca-certificates tzdata git tar zstd zfs fuse-overlayfs rsync iptables iproute2 && \
     if [ "$(uname -m)" = "x86_64" ]; then \
       apk add --no-cache --repository=https://dl-cdn.alpinelinux.org/alpine/edge/testing criu; \
     fi

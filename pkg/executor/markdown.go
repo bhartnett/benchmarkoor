@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/go-units"
+	"github.com/ethpandaops/benchmarkoor/pkg/blockdev"
 	"github.com/ethpandaops/benchmarkoor/pkg/cputopology"
 )
 
@@ -48,6 +50,13 @@ type markdownSystemInfo struct {
 	CPUCacheKB         int               `json:"cpu_cache_kb"`
 	MemoryTotalGB      float64           `json:"memory_total_gb"`
 	CPUTopology        []cputopology.CPU `json:"cpu_topology,omitempty"`
+	Storage            *markdownStorage  `json:"storage,omitempty"`
+}
+
+type markdownStorage struct {
+	Filesystem string                `json:"filesystem,omitempty"`
+	Device     *blockdev.Device      `json:"device,omitempty"`
+	Probe      *blockdev.ProbeResult `json:"probe,omitempty"`
 }
 
 type markdownInstance struct {
@@ -59,13 +68,18 @@ type markdownInstance struct {
 }
 
 type markdownResourceLimits struct {
-	CpusetCpus     string  `json:"cpuset_cpus,omitempty"`
-	CpusetTopology string  `json:"cpuset_topology,omitempty"`
-	Memory         string  `json:"memory,omitempty"`
-	MemoryBytes    int64   `json:"memory_bytes,omitempty"`
-	CPUFreqKHz     *uint64 `json:"cpu_freq_khz,omitempty"`
-	CPUTurboBoost  *bool   `json:"cpu_turboboost,omitempty"`
-	CPUGovernor    string  `json:"cpu_freq_governor,omitempty"`
+	CpusetCpus      string  `json:"cpuset_cpus,omitempty"`
+	CpusetTopology  string  `json:"cpuset_topology,omitempty"`
+	Memory          string  `json:"memory,omitempty"`
+	MemoryBytes     int64   `json:"memory_bytes,omitempty"`
+	CPUFreqKHz      *uint64 `json:"cpu_freq_khz,omitempty"`
+	CPUTurboBoost   *bool   `json:"cpu_turboboost,omitempty"`
+	CPUGovernor     string  `json:"cpu_freq_governor,omitempty"`
+	DevicePath      string  `json:"device_path,omitempty"`
+	DeviceReadBps   uint64  `json:"device_read_bps,omitempty"`
+	DeviceReadIOps  uint64  `json:"device_read_iops,omitempty"`
+	DeviceWriteBps  uint64  `json:"device_write_bps,omitempty"`
+	DeviceWriteIOps uint64  `json:"device_write_iops,omitempty"`
 }
 
 type markdownMetadata struct {
@@ -82,6 +96,14 @@ type markdownTestCounts struct {
 	Total  int `json:"total"`
 	Passed int `json:"passed"`
 	Failed int `json:"failed"`
+}
+
+// rejectedTestInfo holds the payloads of a test that the client rejected as
+// the fixture expects.
+type rejectedTestInfo struct {
+	Name       string
+	Payloads   int
+	DurationNs int64
 }
 
 // failedTestInfo holds information about a single failed test.
@@ -156,7 +178,9 @@ func GenerateRunMarkdown(
 	writeResourceLimits(&sb, cfg.Instance, cfg.System)
 	writeMetadata(&sb, cfg.Metadata)
 
-	// Failed tests section is last — it gets truncated if needed.
+	// The per-test sections are last — they get truncated if needed.
+	writeRejectedTests(&sb, collectRejectedTests(result), maxChars)
+
 	failed := collectFailedTests(result)
 	writeFailedTests(&sb, failed, maxChars)
 
@@ -276,7 +300,62 @@ func writeSystem(sb *strings.Builder, sys *markdownSystemInfo) {
 		fmt.Fprintf(sb, "| Kernel | %s |\n", sys.KernelVersion)
 	}
 
+	writeStorage(sb, sys.Storage)
+
 	sb.WriteByte('\n')
+}
+
+// writeStorage adds the datadir block device rows to the system table.
+func writeStorage(sb *strings.Builder, st *markdownStorage) {
+	if st == nil || st.Device == nil {
+		return
+	}
+
+	dev := st.Device
+	details := make([]string, 0, 3)
+
+	if dev.Kind != "" {
+		details = append(details, dev.Kind)
+	}
+
+	if dev.Model != "" {
+		details = append(details, dev.Model)
+	}
+
+	if dev.SizeBytes > 0 {
+		details = append(details, units.HumanSize(float64(dev.SizeBytes)))
+	}
+
+	value := dev.Path
+	if len(details) > 0 {
+		value += " (" + strings.Join(details, ", ") + ")"
+	}
+
+	fmt.Fprintf(sb, "| Storage Device | %s |\n", value)
+
+	if st.Filesystem != "" {
+		fmt.Fprintf(sb, "| Filesystem | %s |\n", st.Filesystem)
+	}
+
+	if p := st.Probe; p != nil {
+		randLabel, seqLabel := "Disk Random 4K IOPS", "Disk Sequential"
+		if p.RandReadPercent > 0 {
+			randLabel += fmt.Sprintf(" (%d/%d mix)", p.RandReadPercent, 100-p.RandReadPercent)
+		}
+
+		if p.SeqReadPercent > 0 {
+			seqLabel += fmt.Sprintf(" (%d/%d mix)", p.SeqReadPercent, 100-p.SeqReadPercent)
+		}
+
+		fmt.Fprintf(sb, "| %s | %.0f read / %.0f write |\n", randLabel, p.RandReadIOPS, p.RandWriteIOPS)
+		fmt.Fprintf(sb, "| %s | %s/s read / %s/s write |\n",
+			seqLabel, units.BytesSize(p.SeqReadBps), units.BytesSize(p.SeqWriteBps))
+
+		if r, w := p.QD1RandRead, p.QD1RandWrite; r != nil && w != nil {
+			fmt.Fprintf(sb, "| Disk QD1 Random 4K IOPS | %.0f read (p99 %.0f µs) / %.0f write (p99 %.0f µs) |\n",
+				r.IOPS, r.P99Us, w.IOPS, w.P99Us)
+		}
+	}
 }
 
 func writeResourceLimits(sb *strings.Builder, inst *markdownInstance, sys *markdownSystemInfo) {
@@ -289,7 +368,7 @@ func writeResourceLimits(sb *strings.Builder, inst *markdownInstance, sys *markd
 	// Check if there's anything to show.
 	if rl.CpusetCpus == "" && rl.Memory == "" &&
 		rl.CPUFreqKHz == nil && rl.CPUTurboBoost == nil &&
-		rl.CPUGovernor == "" {
+		rl.CPUGovernor == "" && rl.DevicePath == "" {
 		return
 	}
 
@@ -334,6 +413,26 @@ func writeResourceLimits(sb *strings.Builder, inst *markdownInstance, sys *markd
 
 	if rl.CPUGovernor != "" {
 		fmt.Fprintf(sb, "| CPU Governor | %s |\n", rl.CPUGovernor)
+	}
+
+	if rl.DevicePath != "" {
+		fmt.Fprintf(sb, "| Disk Device | %s |\n", rl.DevicePath)
+	}
+
+	if rl.DeviceReadIOps > 0 {
+		fmt.Fprintf(sb, "| Disk Read IOPS | %d |\n", rl.DeviceReadIOps)
+	}
+
+	if rl.DeviceWriteIOps > 0 {
+		fmt.Fprintf(sb, "| Disk Write IOPS | %d |\n", rl.DeviceWriteIOps)
+	}
+
+	if rl.DeviceReadBps > 0 {
+		fmt.Fprintf(sb, "| Disk Read Bandwidth | %s/s |\n", units.BytesSize(float64(rl.DeviceReadBps)))
+	}
+
+	if rl.DeviceWriteBps > 0 {
+		fmt.Fprintf(sb, "| Disk Write Bandwidth | %s/s |\n", units.BytesSize(float64(rl.DeviceWriteBps)))
 	}
 
 	sb.WriteByte('\n')
@@ -464,6 +563,77 @@ func writeFailedTests(
 
 		sb.WriteString(row)
 	}
+}
+
+// writeRejectedTests lists the tests whose payloads the client rejected as
+// the fixture expects, with the time the client took to reject them.
+func writeRejectedTests(
+	sb *strings.Builder,
+	rejected []rejectedTestInfo,
+	maxChars int,
+) {
+	if len(rejected) == 0 {
+		return
+	}
+
+	sb.WriteString("## Rejected Payloads\n\n")
+	sb.WriteString("Expected rejections: the client must reject these payloads.\n\n")
+	sb.WriteString("| Test | Payloads | Time to Reject |\n")
+	sb.WriteString("|---|---|---|\n")
+
+	// Reserve space for the truncation message.
+	const reserveChars = 100
+
+	for i, rt := range rejected {
+		row := fmt.Sprintf("| %s | %d | %s |\n",
+			rt.Name, rt.Payloads, formatDurationNs(rt.DurationNs))
+
+		if maxChars > 0 && sb.Len()+len(row)+reserveChars > maxChars {
+			fmt.Fprintf(sb,
+				"\n*%d more rejected test(s) not shown "+
+					"(output truncated at %d chars)*\n\n",
+				len(rejected)-i, maxChars)
+
+			return
+		}
+
+		sb.WriteString(row)
+	}
+
+	sb.WriteByte('\n')
+}
+
+// collectRejectedTests returns, sorted by name, the tests whose test step
+// has payloads that the client rejected as the fixture expects.
+func collectRejectedTests(result *RunResult) []rejectedTestInfo {
+	if result == nil {
+		return nil
+	}
+
+	rejected := make([]rejectedTestInfo, 0)
+
+	for name, test := range result.Tests {
+		if test.Steps == nil || test.Steps.Test == nil {
+			continue
+		}
+
+		agg := test.Steps.Test.Aggregated
+		if agg == nil || agg.Rejected == 0 {
+			continue
+		}
+
+		rejected = append(rejected, rejectedTestInfo{
+			Name:       name,
+			Payloads:   agg.Rejected,
+			DurationNs: agg.RejectedTimeTotal,
+		})
+	}
+
+	sort.Slice(rejected, func(i, j int) bool {
+		return rejected[i].Name < rejected[j].Name
+	})
+
+	return rejected
 }
 
 // collectFailedTests iterates the result and returns a sorted list of

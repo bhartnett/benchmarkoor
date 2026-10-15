@@ -343,17 +343,46 @@ paths:
         Returns all indexed runs across all discovery paths, sorted by
         timestamp descending. Same shape as `index.json` with an additional
         `discovery_path` field per entry.
+
+        The payload is large and changes only when a run is indexed or
+        deleted. The response carries an `ETag`; send it back as
+        `If-None-Match` to get a `304` instead of the body. The identity
+        and the gzip representation carry different entity tags, so replay
+        the tag under the same `Accept-Encoding` that produced it.
       security:
         - cookieAuth: []
         - bearerAuth: []
         - {}
+      parameters:
+        - name: If-None-Match
+          in: header
+          required: false
+          schema:
+            type: string
+          description: ETag from a previous response. A match returns `304`.
       responses:
         "200":
           description: Index listing
+          headers:
+            ETag:
+              description: Validator for the returned body.
+              schema:
+                type: string
+            Cache-Control:
+              description: Always `no-cache`, so clients revalidate each poll.
+              schema:
+                type: string
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/IndexResponse"
+        "304":
+          description: Not modified since the supplied `If-None-Match`
+          headers:
+            ETag:
+              description: Validator for the unchanged body.
+              schema:
+                type: string
         "401":
           description: Not authenticated
           content:
@@ -465,7 +494,16 @@ paths:
         **Filter columns:** id, suite_hash, test_name, run_id, client,
         total_gas_used, total_time_ns, total_mgas_s, setup_gas_used,
         setup_time_ns, setup_mgas_s, test_gas_used, test_time_ns,
-        test_mgas_s, run_start, run_end
+        test_mgas_s, setup_rejected_time_ns, test_rejected_time_ns,
+        run_start, run_end
+
+        `setup_rejected_time_ns` and `test_rejected_time_ns` are the time the
+        client took to reject the step's payloads that the fixture marks
+        invalid (for example `test_rejected_time_ns=gt.0`). A rejected payload
+        reports no gas, so this time is not in `setup_time_ns` or
+        `test_time_ns`, which stay the denominator of the step MGas/s.
+        `total_time_ns` includes it, and `total_mgas_s` uses only the
+        gas-reporting time.
       security:
         - cookieAuth: []
         - bearerAuth: []
@@ -1133,6 +1171,281 @@ paths:
                     type: string
                     example: Indexing pass already in progress
 
+  /admin/indexer/stats:
+    get:
+      operationId: getIndexerStats
+      tags: [admin]
+      summary: Recent indexing passes
+      description: |
+        Reports the most recent indexing passes, newest first: how long each
+        one took and what it did. It is what shows a pass getting slower
+        before it gets slow enough to notice.
+
+        The indexer writes a row when a pass ends and keeps the last few
+        hundred, so `limit` above that returns everything there is. A pass
+        with status `cancelled` was cut short by a shutdown, either between
+        two discovery paths or inside one, so its counters describe only the
+        work it got through.
+
+        A pass in flight has no row yet: it is reported by `running` and
+        `current_pass`, which carries when it started and how long it has
+        been going.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          description: How many passes to return. Default 100, maximum 500.
+          schema:
+            type: integer
+            default: 100
+            minimum: 1
+            maximum: 500
+      responses:
+        "200":
+          description: Pass history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexerStatsResponse"
+        "400":
+          description: Indexing is not enabled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/database:
+    get:
+      operationId: getDatabaseStats
+      tags: [admin]
+      summary: Index database size and contents
+      description: |
+        Reports how large the index database is, what is in it, and how much
+        room is left on its volume, so an admin can tell whether a cleanup is
+        due before the disk fills.
+
+        The report is built per request and uses only cheap queries. The
+        per-test tables (`test_stats`, `test_stats_block_logs`) hold tens of
+        millions of rows, so the report never counts them. Their row counts
+        are estimates from the primary-key span, and the per-suite breakdown
+        reads only the `runs` table.
+
+        Per-table byte sizes are not reported: this build of SQLite has no
+        `dbstat` virtual table. `free_pages * page_size` is what a VACUUM
+        would hand back, but a VACUUM needs as much free space again as the
+        database occupies.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Database report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseStatsResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/indexer/failures:
+    get:
+      operationId: listIndexerFailures
+      tags: [admin]
+      summary: List runs the indexer could not index
+      description: |
+        Returns runs that storage exposes but the indexer cannot index,
+        usually because the run directory never got its `config.json`.
+
+        A run is only recorded once it is older than the indexer's failure
+        grace period, so a run still uploading never appears here. A recorded
+        run is skipped by later passes until the retry interval lapses, and
+        its record disappears on its own if the run later indexes or leaves
+        storage.
+
+        Newest run first. A neglected deployment holds thousands of these, so
+        the listing is paged.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 200
+            minimum: 1
+            maximum: 1000
+          description: Page size. Out-of-range values are clamped.
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        "200":
+          description: Recorded index failures
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexerFailuresResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/indexer/failures/delete:
+    post:
+      operationId: deleteIndexerFailures
+      tags: [admin]
+      summary: Queue failed runs so their stored data is deleted
+      description: |
+        Queues the stored data of failed runs for deletion. The request
+        returns as soon as every record is marked; a background worker does
+        the storage deletes in queue order and drops each record once its
+        data is gone.
+
+        Pass either `run_ids` or `all`. A run whose delete fails keeps its
+        place in the queue with the reason on its record, and is retried.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IndexerFailuresActionRequest"
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  queued:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: Neither run_ids nor all was given
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Storage backend does not support deletion
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /admin/indexer/failures/delete/cancel:
+    post:
+      operationId: cancelDeleteIndexerFailures
+      tags: [admin]
+      summary: Take failed runs out of the deletion queue
+      description: |
+        Best-effort: a record the worker is deleting at this moment is still
+        removed from the queue. A record that is not queued counts as
+        cancelled. Pass either `run_ids` or `all`.
+      security:
+        - cookieAuth: []
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IndexerFailuresActionRequest"
+      responses:
+        "200":
+          description: Cancelled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  cancelled:
+                    type: integer
+                  errors:
+                    type: array
+                    items:
+                      type: string
+        "400":
+          description: Neither run_ids nor all was given
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Not authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Insufficient permissions
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /admin/runs/delete:
     post:
       operationId: deleteRuns
@@ -1153,6 +1466,13 @@ paths:
         `running` is refused, because deleting it would race with the active
         runner. Partial success is possible — the response includes a count of
         queued runs and any per-run errors.
+
+        `suite_hashes` queues every run of the named suites, at most 200 per
+        request. A suite can hold thousands of runs, so the server resolves
+        them rather than making the client send every ID. Runs of that suite
+        which are still running, and runs that were already queued, are both
+        reported in `errors`, so a repeat request explains why it queued
+        nothing. Give `run_ids`, `suite_hashes`, or both.
       security:
         - cookieAuth: []
         - bearerAuth: []
@@ -1162,7 +1482,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [run_ids]
+              description: Give run_ids, suite_hashes, or both.
               properties:
                 run_ids:
                   type: array
@@ -1170,6 +1490,13 @@ paths:
                     type: string
                   description: List of run IDs to delete
                   example: ["abc123", "def456"]
+                suite_hashes:
+                  type: array
+                  maxItems: 200
+                  items:
+                    type: string
+                  description: Queue every run of these suites
+                  example: ["22c2404b9ce3f47c"]
       responses:
         "202":
           description: Runs queued for deletion (may include partial errors)
@@ -1352,6 +1679,297 @@ components:
         status:
           type: string
           example: ok
+
+    # ── Database report schemas ─────────────────────────────────────
+
+    DatabaseTableStat:
+      type: object
+      required: [name, rows]
+      properties:
+        name:
+          type: string
+          example: test_stats
+        rows:
+          type: integer
+          format: int64
+        estimated:
+          type: boolean
+          description: >-
+            True when `rows` is `MAX(id) - MIN(id) + 1`, not a `COUNT(*)`.
+            It is an upper bound: deletes in the middle of the ID range do
+            not lower it.
+
+    DatabaseSuiteUsage:
+      type: object
+      description: |
+        How much of the database one suite accounts for. Deleting a suite's
+        runs cascades to its test stats and block logs, so this is roughly
+        what a cleanup frees.
+      required: [suite_hash, runs, tests]
+      properties:
+        suite_hash:
+          type: string
+        name:
+          type: string
+        discovery_path:
+          type: string
+        runs:
+          type: integer
+          format: int64
+        tests:
+          type: integer
+          format: int64
+          description: >-
+            The sum of `tests_total` over the suite's runs. It stands in for
+            the suite's `test_stats` rows, which are too many to count.
+        last_run:
+          type: integer
+          format: int64
+          description: Unix seconds of the newest run.
+
+    DatabaseStats:
+      type: object
+      required: [driver, tables, top_suites]
+      properties:
+        driver:
+          type: string
+          example: sqlite
+        path:
+          type: string
+          description: The SQLite file. Absent for other drivers.
+        file_bytes:
+          type: integer
+          format: int64
+        wal_bytes:
+          type: integer
+          format: int64
+          description: The write-ahead log, which a long writer can leave large.
+        page_size:
+          type: integer
+          format: int64
+        page_count:
+          type: integer
+          format: int64
+        free_pages:
+          type: integer
+          format: int64
+          description: Pages a VACUUM would hand back.
+        volume_total_bytes:
+          type: integer
+          format: int64
+        volume_used_bytes:
+          type: integer
+          format: int64
+          description: |
+            What files occupy. This plus `volume_free_bytes` is less than
+            `volume_total_bytes`, because a filesystem reserves a slice for
+            root. A usage share is used/(used+free), the way df computes it.
+        volume_free_bytes:
+          type: integer
+          format: int64
+          description: |
+            What is still available to a non-root process. The number that
+            decides whether a cleanup is urgent.
+        oldest_run:
+          type: integer
+          format: int64
+        newest_run:
+          type: integer
+          format: int64
+        tables:
+          type: array
+          items:
+            $ref: "#/components/schemas/DatabaseTableStat"
+        top_suites:
+          type: array
+          items:
+            $ref: "#/components/schemas/DatabaseSuiteUsage"
+
+    DatabaseStatsResponse:
+      type: object
+      required: [gathered_at, stats]
+      properties:
+        gathered_at:
+          type: string
+          format: date-time
+          description: When the figures were taken.
+        stats:
+          $ref: "#/components/schemas/DatabaseStats"
+
+    # ── Indexer pass schemas ────────────────────────────────────────
+
+    IndexerPass:
+      type: object
+      required: [started_at, finished_at, duration_ms, trigger, status]
+      properties:
+        started_at:
+          type: string
+          format: date-time
+        finished_at:
+          type: string
+          format: date-time
+        duration_ms:
+          type: integer
+          format: int64
+          description: How long the pass took, in milliseconds.
+        trigger:
+          type: string
+          enum: [startup, schedule, manual]
+          description: What started the pass.
+        status:
+          type: string
+          enum: [completed, cancelled]
+          description: |
+            How the pass ended. A shutdown cut a cancelled pass short, either
+            between two discovery paths or inside one, so its counters cover
+            only the work it got through. Runs whose reads the shutdown
+            cancelled are not counted in `runs_failed`: the shutdown is not
+            the run's fault.
+        discovery_paths:
+          type: integer
+          description: How many discovery paths the pass walked.
+        storage_runs:
+          type: integer
+          description: How many run directories storage held.
+        indexed_runs:
+          type: integer
+          description: |
+            How many of those the index already had. The gap to storage_runs
+            is the backlog the pass started with.
+        runs_indexed:
+          type: integer
+          description: Runs the pass added to the index.
+        runs_reindexed:
+          type: integer
+          description: Incomplete runs the pass read again.
+        runs_failed:
+          type: integer
+          description: Runs the pass could not index at all.
+        skipped_failures:
+          type: integer
+          description: |
+            Runs the pass never read, because their failure record is still
+            inside the retry interval.
+        error:
+          type: string
+          description: The last discovery path failure of the pass, if any.
+
+    RunningIndexerPass:
+      type: object
+      required: [started_at, trigger, elapsed_ms]
+      properties:
+        started_at:
+          type: string
+          format: date-time
+          description: When the running pass started.
+        trigger:
+          type: string
+          enum: [startup, schedule, manual]
+        elapsed_ms:
+          type: integer
+          format: int64
+          description: |
+            How long the pass had been running when this response was built.
+            Measured on the server, so a client with a skewed clock still
+            shows the right elapsed time.
+
+    IndexerStatsResponse:
+      type: object
+      required: [running, limit, passes]
+      properties:
+        running:
+          type: boolean
+          description: |
+            Whether a pass is in flight right now. Starting another while it
+            is would only be refused with 409, so the UI waits instead.
+        current_pass:
+          allOf:
+            - $ref: "#/components/schemas/RunningIndexerPass"
+          description: |
+            The pass in flight. Absent when none is running. A pass only
+            writes its history row when it ends, so until then this is the
+            only place it appears.
+        interval:
+          type: string
+          description: The configured delay between passes, as a Go duration.
+          example: 5m0s
+        limit:
+          type: integer
+        passes:
+          type: array
+          description: The most recent passes, newest first.
+          items:
+            $ref: "#/components/schemas/IndexerPass"
+
+    # ── Indexer housekeeping schemas ────────────────────────────────
+
+    IndexerFailure:
+      type: object
+      required: [run_id, discovery_path, attempts]
+      properties:
+        run_id:
+          type: string
+          example: 1790344061_c0f24cc0_reth-bal-full
+        discovery_path:
+          type: string
+          example: repricings/results
+        run_timestamp:
+          type: integer
+          format: int64
+          description: |
+            Unix seconds taken from the run ID, which is named
+            `{timestamp}_{shortID}_{instance}`. The run has no config.json,
+            so the ID is the only place a timestamp survives. Absent when
+            the ID does not follow the convention.
+        error:
+          type: string
+          description: The failure of the most recent attempt.
+          example: config.json not found
+        attempts:
+          type: integer
+          description: How many indexing attempts have failed.
+        first_failed_at:
+          type: string
+          format: date-time
+        last_attempt_at:
+          type: string
+          format: date-time
+        deletion_requested_at:
+          type: string
+          format: date-time
+          description: Present while the run sits in the deletion queue.
+        deletion_error:
+          type: string
+          description: The last failed deletion attempt. The run stays queued.
+
+    IndexerFailuresResponse:
+      type: object
+      required: [total, limit, offset, entries]
+      properties:
+        total:
+          type: integer
+          format: int64
+          description: Recorded failures in total, not just on this page.
+        limit:
+          type: integer
+        offset:
+          type: integer
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/IndexerFailure"
+
+    IndexerFailuresActionRequest:
+      type: object
+      description: Give either run_ids or all.
+      properties:
+        run_ids:
+          type: array
+          items:
+            type: string
+        all:
+          type: boolean
+          description: Act on every recorded failure.
 
     # ── Auth schemas ────────────────────────────────────────────────
     LoginRequest:
@@ -1863,6 +2481,12 @@ components:
         setup_mgas_s:
           type: number
           format: double
+        setup_rejected_time_ns:
+          type: integer
+          format: int64
+          description: |
+            Time the client took to reject the setup step's payloads that the
+            fixture marks invalid. 0 when the step has none.
         test_gas_used:
           type: integer
           format: uint64
@@ -1872,6 +2496,13 @@ components:
         test_mgas_s:
           type: number
           format: double
+        test_rejected_time_ns:
+          type: integer
+          format: int64
+          description: |
+            Time the client took to reject the test step's payloads that the
+            fixture marks invalid. 0 when the step has none. It is not in
+            test_time_ns, which stays the denominator of test_mgas_s.
         run_start:
           type: integer
           format: int64

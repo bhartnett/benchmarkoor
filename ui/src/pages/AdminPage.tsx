@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { useNavigate, useSearch } from '@tanstack/react-router'
+import { useEffect, useMemo, useState } from 'react'
+import { Link, useNavigate, useSearch } from '@tanstack/react-router'
 import { useAuth } from '@/hooks/useAuth'
 import type { AuthConfig } from '@/api/auth-client'
 import type { AuthUser } from '@/api/auth-client'
@@ -18,10 +18,36 @@ import {
   useUpsertUserMapping,
   useDeleteUserMapping,
   useRunIndexer,
+  useIndexerStats,
+  useIndexerFailures,
+  useDeleteIndexerFailures,
+  useCancelDeleteIndexerFailures,
+  useDatabaseStats,
+  INDEXER_FAILURES_PAGE_SIZE,
   type AdminSession,
+  type IndexerFailure,
+  type IndexerFailureSelection,
+  type IndexerPass,
+  type DatabaseStats,
 } from '@/api/hooks/useAdmin'
 import { useAdminApiKeys, useDeleteAdminApiKey, type AdminApiKey } from '@/api/hooks/useApiKeys'
-import { Plus, Pencil, Trash2, Play, Loader2, ChevronUp, ChevronDown } from 'lucide-react'
+import { IndexerPassCharts } from '@/components/admin/IndexerPassCharts'
+import { formatPassDuration, passTriggerLabel } from '@/components/admin/constants'
+import { formatBytes, formatNumber } from '@/utils/format'
+import {
+  Plus,
+  Pencil,
+  Trash2,
+  Play,
+  Loader2,
+  ChevronUp,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  AlertTriangle,
+  Undo2,
+  Database,
+} from 'lucide-react'
 import clsx from 'clsx'
 
 type SortDirection = 'asc' | 'desc'
@@ -93,7 +119,7 @@ const cmpDateNullable = (a: string | null, b: string | null) => {
   return cmpDate(a, b)
 }
 
-type Tab = 'users' | 'github-mappings' | 'sessions' | 'api-keys'
+type Tab = 'users' | 'github-mappings' | 'sessions' | 'api-keys' | 'indexer' | 'database'
 
 export function AdminPage() {
   const { isAdmin, authConfig } = useAuth()
@@ -104,6 +130,10 @@ export function AdminPage() {
     if (authConfig?.auth.github_enabled) result.push({ key: 'github-mappings', label: 'GitHub Mappings' })
     result.push({ key: 'sessions', label: 'Sessions' })
     result.push({ key: 'api-keys', label: 'API Keys' })
+    if (authConfig?.indexing?.enabled) {
+      result.push({ key: 'indexer', label: 'Indexer' })
+      result.push({ key: 'database', label: 'Database' })
+    }
     return result
   }, [authConfig])
 
@@ -153,6 +183,8 @@ export function AdminPage() {
           {resolvedTab === 'github-mappings' && <GitHubMappingsTab />}
           {resolvedTab === 'sessions' && <SessionsTab />}
           {resolvedTab === 'api-keys' && <AdminAPIKeysTab />}
+          {resolvedTab === 'indexer' && <IndexerTab />}
+          {resolvedTab === 'database' && <DatabaseTab />}
         </>
       )}
     </div>
@@ -653,28 +685,915 @@ function AdminAPIKeysTab() {
   )
 }
 
+// --- Database Tab ---
+
+// Above these shares of the volume a cleanup stops being optional.
+const VOLUME_CRITICAL = 0.9
+const VOLUME_WARNING = 0.75
+
+/**
+ * The share of the volume in use, the way df computes it. Used and free do not
+ * add up to total, because a filesystem reserves a slice for root that this
+ * process cannot write to. Dividing by total would count that reserve as free
+ * space we could use, and would read the pod's volume as 88% rather than the
+ * 93% df reports.
+ */
+function volumeShare(used: number, free: number): number {
+  const usable = used + free
+
+  return usable > 0 ? used / usable : 0
+}
+
+function StatCard({
+  label,
+  value,
+  hint,
+  tone = 'normal',
+}: {
+  label: string
+  value: string
+  hint?: string
+  tone?: 'normal' | 'warning' | 'critical'
+}) {
+  return (
+    <div className="rounded-sm border border-gray-200 px-4 py-3 dark:border-gray-700">
+      <div className="text-xs font-medium text-gray-500 uppercase dark:text-gray-400">{label}</div>
+      <div
+        className={clsx(
+          'mt-1 text-lg font-semibold',
+          tone === 'critical' && 'text-red-600 dark:text-red-400',
+          tone === 'warning' && 'text-amber-600 dark:text-amber-400',
+          tone === 'normal' && 'text-gray-900 dark:text-gray-100',
+        )}
+      >
+        {value}
+      </div>
+      {hint && <div className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{hint}</div>}
+    </div>
+  )
+}
+
+function VolumeBar({ used, free, total }: { used: number; free: number; total: number }) {
+  const share = volumeShare(used, free)
+  const pct = Math.min(100, Math.round(share * 100))
+
+  return (
+    <div>
+      <div className="mb-1 flex items-baseline justify-between text-sm">
+        <span className="text-gray-700 dark:text-gray-300">
+          {formatBytes(used)} used, {formatBytes(free)} free of {formatBytes(total)}
+        </span>
+        <span
+          className={clsx(
+            'font-semibold',
+            share >= VOLUME_CRITICAL
+              ? 'text-red-600 dark:text-red-400'
+              : share >= VOLUME_WARNING
+                ? 'text-amber-600 dark:text-amber-400'
+                : 'text-gray-700 dark:text-gray-300',
+          )}
+        >
+          {pct}%
+        </span>
+      </div>
+      <div className="h-2 overflow-hidden rounded-full bg-gray-200 dark:bg-gray-700">
+        <div
+          className={clsx(
+            'h-full rounded-full',
+            share >= VOLUME_CRITICAL
+              ? 'bg-red-500'
+              : share >= VOLUME_WARNING
+                ? 'bg-amber-500'
+                : 'bg-green-500',
+          )}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+    </div>
+  )
+}
+
+function DatabaseTab() {
+  const { data, isLoading, error } = useDatabaseStats(true)
+
+  if (isLoading) return <div className="text-sm text-gray-500">Loading...</div>
+
+  // Only give up the whole report when there is nothing to show. React Query
+  // keeps the last good data across a failed refetch, and a blip on the poll
+  // is no reason to blank a report the admin is reading.
+  if (!data) {
+    return (
+      <div className="rounded-sm border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+        {error instanceof Error ? error.message : 'Failed to load database stats'}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex flex-col gap-6">
+      {error && (
+        <div className="rounded-sm border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-700 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
+          Could not refresh. Showing the last report.
+        </div>
+      )}
+      <DatabaseStorage stats={data.stats} gatheredAt={data.gathered_at} />
+      <DatabaseTables stats={data.stats} />
+      <DatabaseSuites stats={data.stats} />
+    </div>
+  )
+}
+
+function DatabaseStorage({ stats, gatheredAt }: { stats: DatabaseStats; gatheredAt: string }) {
+  const total = stats.volume_total_bytes ?? 0
+  const free = stats.volume_free_bytes ?? 0
+  const used = stats.volume_used_bytes ?? 0
+  const share = volumeShare(used, free)
+  const reclaimable = (stats.free_pages ?? 0) * (stats.page_size ?? 0)
+
+  return (
+    <section>
+      <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <h2 className="flex items-center gap-2 text-sm font-medium text-gray-700 dark:text-gray-300">
+          <Database className="size-4" />
+          Storage
+        </h2>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          {stats.driver}
+          {stats.path && <span className="ml-2 font-mono">{stats.path}</span>}
+        </span>
+        <span className="ml-auto text-xs text-gray-400 dark:text-gray-500">
+          Gathered {formatTimestamp(gatheredAt)}
+        </span>
+      </div>
+
+      {total > 0 && (
+        <div className="mb-4 rounded-sm border border-gray-200 px-4 py-3 dark:border-gray-700">
+          <VolumeBar used={used} free={free} total={total} />
+          {share >= VOLUME_WARNING && (
+            <p className="mt-2 flex items-start gap-1.5 text-xs text-amber-700 dark:text-amber-400">
+              <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
+              <span>
+                The volume holding the index database is filling up. Deleting the runs of a
+                suite you no longer need frees both its storage objects and its index rows.
+              </span>
+            </p>
+          )}
+        </div>
+      )}
+
+      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          label="Database file"
+          value={formatBytes(stats.file_bytes)}
+          hint={stats.page_count ? `${formatNumber(stats.page_count)} pages` : undefined}
+          tone={share >= VOLUME_CRITICAL ? 'critical' : 'normal'}
+        />
+        <StatCard
+          label="Write-ahead log"
+          value={formatBytes(stats.wal_bytes)}
+          hint="Checkpointed by SQLite"
+        />
+        <StatCard
+          label="Reclaimable"
+          value={formatBytes(reclaimable)}
+          hint="Freed by VACUUM, which needs the same free space again"
+        />
+        <StatCard
+          label="Free on volume"
+          value={formatBytes(free)}
+          tone={
+            share >= VOLUME_CRITICAL ? 'critical' : share >= VOLUME_WARNING ? 'warning' : 'normal'
+          }
+        />
+      </div>
+    </section>
+  )
+}
+
+function DatabaseTables({ stats }: { stats: DatabaseStats }) {
+  const totalRows = stats.tables.reduce((sum, table) => sum + table.rows, 0)
+  const anyEstimated = stats.tables.some((table) => table.estimated)
+
+  return (
+    <section>
+      <h2 className="mb-3 text-sm font-medium text-gray-700 dark:text-gray-300">
+        Tables · {anyEstimated && '~'}
+        {formatNumber(totalRows)} rows
+      </h2>
+      <div className="overflow-hidden rounded-sm border border-gray-200 dark:border-gray-700">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-gray-50 text-xs text-gray-500 uppercase dark:bg-gray-800 dark:text-gray-400">
+            <tr>
+              <th className="px-4 py-2">Table</th>
+              <th className="px-4 py-2 text-right">Rows</th>
+              <th className="px-4 py-2 text-right">Share</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+            {stats.tables.map((table) => (
+              <tr key={table.name} className="bg-white dark:bg-gray-900">
+                <td className="px-4 py-2 font-mono text-xs text-gray-700 dark:text-gray-300">
+                  {table.name}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-700 dark:text-gray-300">
+                  {table.estimated && '~'}
+                  {formatNumber(table.rows)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-500 dark:text-gray-400">
+                  {totalRows > 0 ? `${Math.round((table.rows / totalRows) * 100)}%` : '-'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+        {anyEstimated && (
+          <>
+            A count with ~ is the primary-key span, not a full count. These tables are too large
+            to count on each request, and the span is an upper bound.{' '}
+          </>
+        )}
+        Byte sizes per table are not shown: this build of SQLite has no{' '}
+        <code className="font-mono">dbstat</code> table, and an estimate would be worse than
+        leaving it out.
+      </p>
+    </section>
+  )
+}
+
+function DatabaseSuites({ stats }: { stats: DatabaseStats }) {
+  if (stats.top_suites.length === 0) return null
+
+  return (
+    <section>
+      <h2 className="mb-3 text-sm font-medium text-gray-700 dark:text-gray-300">
+        Biggest suites
+      </h2>
+      <div className="overflow-x-auto rounded-sm border border-gray-200 dark:border-gray-700">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-gray-50 text-xs text-gray-500 uppercase dark:bg-gray-800 dark:text-gray-400">
+            <tr>
+              <th className="px-4 py-2">Suite</th>
+              <th className="px-4 py-2">Discovery path</th>
+              <th className="px-4 py-2 text-right">Runs</th>
+              <th className="px-4 py-2 text-right">Tests</th>
+              <th className="px-4 py-2">Last run</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+            {stats.top_suites.map((suite) => (
+              <tr key={suite.suite_hash} className="bg-white dark:bg-gray-900">
+                <td className="px-4 py-2">
+                  <Link
+                    to="/suites/$suiteHash"
+                    params={{ suiteHash: suite.suite_hash }}
+                    className="text-blue-600 hover:underline dark:text-blue-400"
+                  >
+                    {suite.name || <span className="font-mono text-xs">{suite.suite_hash}</span>}
+                  </Link>
+                  {suite.name && (
+                    <div className="font-mono text-xs text-gray-500 dark:text-gray-400">
+                      {suite.suite_hash}
+                    </div>
+                  )}
+                </td>
+                <td className="px-4 py-2 text-gray-500 dark:text-gray-400">
+                  {suite.discovery_path || '-'}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-700 dark:text-gray-300">
+                  {formatNumber(suite.runs)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-700 dark:text-gray-300">
+                  {formatNumber(suite.tests)}
+                </td>
+                <td className="px-4 py-2 whitespace-nowrap text-gray-500 dark:text-gray-400">
+                  {suite.last_run
+                    ? formatTimestamp(new Date(suite.last_run * 1000).toISOString())
+                    : '-'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+        Deleting a suite&apos;s runs from the{' '}
+        <Link to="/suites" className="text-blue-600 hover:underline dark:text-blue-400">
+          Suites page
+        </Link>{' '}
+        removes its stored files, its runs, and all of its test rows. Tests is the sum of each
+        run&apos;s test count, which is about the number of test_stats rows it frees.
+      </p>
+    </section>
+  )
+}
+
+// --- Indexer Tab ---
+
+// A run directory is named {timestamp}_{shortID}_{instance}. A run recorded
+// here has no config.json, so that leading field is the only date left.
+function formatRunTimestamp(unixSeconds?: number): string {
+  if (!unixSeconds) return 'unknown'
+  return formatTimestamp(new Date(unixSeconds * 1000).toISOString())
+}
+
+// How many passes the table lists. The charts cover the whole window; the
+// table is there to read the newest few exactly, and to give the charts a
+// text equivalent.
+const RECENT_PASS_ROWS = 10
+
+/**
+ * The middle duration of the window. A median rather than a mean, because one
+ * pass that picked up a thousand new runs would drag a mean away from what a
+ * pass normally costs.
+ */
+function medianDuration(passes: IndexerPass[]): number {
+  if (passes.length === 0) return 0
+
+  const sorted = passes.map((pass) => pass.duration_ms).sort((a, b) => a - b)
+  const middle = Math.floor(sorted.length / 2)
+
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle]
+}
+
+/**
+ * How long the running pass has been going. The server measured the elapsed
+ * time when it answered, so the browser only adds the time since that answer
+ * arrived and never compares its clock with the server's.
+ */
+function useRunningElapsedMs(baseMs: number | undefined, since: number): number {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    if (baseMs === undefined) return
+    const id = setInterval(() => setNow(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [baseMs])
+
+  if (baseMs === undefined) return 0
+
+  // A tick that predates the response reads as "no time has passed yet",
+  // which is exactly right until the next one lands a second later.
+  return baseMs + Math.max(0, now - since)
+}
+
+/**
+ * The pass history: what the last pass cost, what the recent ones cost, and
+ * the button that starts one now.
+ */
+function IndexerPasses() {
+  const { data, isLoading, error, dataUpdatedAt } = useIndexerStats(true)
+  const runIndexer = useRunIndexer()
+  const [message, setMessage] = useState<{ text: string; isError: boolean } | null>(null)
+
+  const passes = useMemo(() => data?.passes ?? [], [data])
+  const last = passes[0]
+  const median = useMemo(() => medianDuration(passes), [passes])
+  const slowest = useMemo(
+    () =>
+      passes.reduce<IndexerPass | undefined>(
+        (worst, pass) =>
+          !worst || pass.duration_ms > worst.duration_ms ? pass : worst,
+        undefined,
+      ),
+    [passes],
+  )
+
+  const current = data?.current_pass
+  const elapsedMs = useRunningElapsedMs(current?.elapsed_ms, dataUpdatedAt)
+
+  // A pass already in flight would only get a 409 back, so the button waits.
+  const busy = runIndexer.isPending || (data?.running ?? false)
+
+  const handleRun = async () => {
+    setMessage(null)
+    try {
+      const result = await runIndexer.mutateAsync()
+      setMessage({ text: result.message, isError: false })
+    } catch (err) {
+      setMessage({
+        text: err instanceof Error ? err.message : 'Failed to trigger indexer',
+        isError: true,
+      })
+    }
+  }
+
+  return (
+    <section className="flex flex-col gap-4">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <h2 className="text-sm font-medium text-gray-700 dark:text-gray-300">
+          Indexing passes
+        </h2>
+        {data?.interval && (
+          <span className="text-xs text-gray-500 dark:text-gray-400">
+            every {data.interval}
+          </span>
+        )}
+        {data?.running && (
+          <span
+            className="flex items-center gap-1.5 text-xs text-blue-600 dark:text-blue-400"
+            title={
+              current
+                ? `Started ${formatTimestamp(current.started_at)} · ` +
+                  `${passTriggerLabel(current.trigger)}`
+                : undefined
+            }
+          >
+            <Loader2 className="size-3 animate-spin" />
+            {current
+              ? `Indexing for ${formatPassDuration(elapsedMs)}`
+              : 'Pass in progress'}
+          </span>
+        )}
+        <button
+          onClick={handleRun}
+          disabled={busy}
+          title={
+            data?.running
+              ? 'A pass is already running. Starting another would be refused.'
+              : 'Start an indexing pass now'
+          }
+          className="ml-auto flex items-center gap-1.5 rounded-sm border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
+        >
+          {busy ? (
+            <Loader2 className="size-3.5 animate-spin" />
+          ) : (
+            <Play className="size-3.5" />
+          )}
+          Run Indexer
+        </button>
+      </div>
+
+      {message && (
+        <div
+          className={clsx(
+            'rounded-sm px-4 py-2 text-sm',
+            message.isError
+              ? 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300'
+              : 'bg-green-50 text-green-700 dark:bg-green-950/40 dark:text-green-300',
+          )}
+        >
+          {message.text}
+        </div>
+      )}
+
+      {isLoading && <div className="text-sm text-gray-500">Loading...</div>}
+
+      {/* React Query keeps the last good data across a failed refetch, so a
+          blip on the poll only blanks the panel when there is nothing left. */}
+      {!isLoading && !data && (
+        <div className="rounded-sm border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+          {error instanceof Error ? error.message : 'Failed to load indexer stats'}
+        </div>
+      )}
+
+      {data && (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+            <StatCard
+              label="Last pass"
+              value={last ? formatPassDuration(last.duration_ms) : '-'}
+              hint={
+                last
+                  ? `${formatTimestamp(last.started_at)} · ${passTriggerLabel(last.trigger)}`
+                  : 'No pass recorded yet'
+              }
+              tone={last && last.status !== 'completed' ? 'warning' : 'normal'}
+            />
+            <StatCard
+              label="New runs, last pass"
+              value={last ? formatNumber(last.runs_indexed) : '-'}
+              hint={
+                last
+                  ? `${formatNumber(last.runs_reindexed)} re-indexed · ` +
+                    `${formatNumber(last.runs_failed)} failed`
+                  : undefined
+              }
+            />
+            <StatCard
+              label="Median duration"
+              value={passes.length > 0 ? formatPassDuration(median) : '-'}
+              hint={`over the last ${passes.length} pass${passes.length === 1 ? '' : 'es'}`}
+            />
+            <StatCard
+              label="Slowest pass"
+              value={slowest ? formatPassDuration(slowest.duration_ms) : '-'}
+              hint={slowest ? formatTimestamp(slowest.started_at) : undefined}
+            />
+          </div>
+
+          <IndexerPassCharts passes={passes} />
+
+          {passes.length > 0 && <RecentPassesTable passes={passes} />}
+        </>
+      )}
+    </section>
+  )
+}
+
+function RecentPassesTable({ passes }: { passes: IndexerPass[] }) {
+  const rows = passes.slice(0, RECENT_PASS_ROWS)
+
+  return (
+    <div>
+      <h3 className="mb-2 text-xs font-medium text-gray-500 uppercase dark:text-gray-400">
+        Recent passes
+      </h3>
+      <div className="overflow-x-auto rounded-sm border border-gray-200 dark:border-gray-700">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-gray-50 text-xs text-gray-500 uppercase dark:bg-gray-800 dark:text-gray-400">
+            <tr>
+              <th className="px-4 py-2">Started</th>
+              <th className="px-4 py-2">Trigger</th>
+              <th className="px-4 py-2 text-right">Duration</th>
+              <th className="px-4 py-2 text-right">New</th>
+              <th className="px-4 py-2 text-right">Re-indexed</th>
+              <th className="px-4 py-2 text-right">Failed</th>
+              <th className="px-4 py-2 text-right">Skipped</th>
+              <th className="px-4 py-2 text-right">In storage</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+            {rows.map((pass) => (
+              <tr key={pass.started_at + pass.trigger} className="bg-white dark:bg-gray-900">
+                <td className="px-4 py-2 whitespace-nowrap text-gray-700 dark:text-gray-300">
+                  {formatTimestamp(pass.started_at)}
+                  {pass.status !== 'completed' && (
+                    <span
+                      className="ml-2 text-xs text-amber-600 dark:text-amber-400"
+                      title={pass.error}
+                    >
+                      {pass.status}
+                    </span>
+                  )}
+                  {pass.status === 'completed' && pass.error && (
+                    <span
+                      className="ml-2 text-xs text-red-600 dark:text-red-400"
+                      title={pass.error}
+                    >
+                      a path failed
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-2 text-gray-500 dark:text-gray-400">
+                  {passTriggerLabel(pass.trigger)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-700 dark:text-gray-300">
+                  {formatPassDuration(pass.duration_ms)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-700 dark:text-gray-300">
+                  {formatNumber(pass.runs_indexed)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-500 dark:text-gray-400">
+                  {formatNumber(pass.runs_reindexed)}
+                </td>
+                <td
+                  className={clsx(
+                    'px-4 py-2 text-right',
+                    pass.runs_failed > 0
+                      ? 'text-red-600 dark:text-red-400'
+                      : 'text-gray-500 dark:text-gray-400',
+                  )}
+                >
+                  {formatNumber(pass.runs_failed)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-500 dark:text-gray-400">
+                  {formatNumber(pass.skipped_failures)}
+                </td>
+                <td className="px-4 py-2 text-right text-gray-500 dark:text-gray-400">
+                  {formatNumber(pass.storage_runs)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+        &quot;Skipped&quot; runs were never read: their failure record is still inside the
+        retry interval. &quot;In storage&quot; is how many run directories the pass found.
+      </p>
+    </div>
+  )
+}
+
+function IndexerTab() {
+  const [offset, setOffset] = useState(0)
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [message, setMessage] = useState<{ text: string; isError: boolean } | null>(null)
+
+  const { data, isLoading, error } = useIndexerFailures(offset, true)
+  const deleteFailures = useDeleteIndexerFailures()
+  const cancelFailures = useCancelDeleteIndexerFailures()
+
+  const entries = useMemo(() => data?.entries ?? [], [data])
+  const total = data?.total ?? 0
+  const busy = deleteFailures.isPending || cancelFailures.isPending
+
+  // A page the worker has drained can leave the offset past the end.
+  const onLastPage = offset + INDEXER_FAILURES_PAGE_SIZE >= total
+
+  const selectableOnPage = useMemo(
+    () => entries.filter((e) => !e.deletion_requested_at).map((e) => e.run_id),
+    [entries],
+  )
+  const allOnPageSelected =
+    selectableOnPage.length > 0 && selectableOnPage.every((id) => selected.has(id))
+
+  const toggleOne = (runId: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(runId)) next.delete(runId)
+      else next.add(runId)
+      return next
+    })
+  }
+
+  const togglePage = () => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (allOnPageSelected) selectableOnPage.forEach((id) => next.delete(id))
+      else selectableOnPage.forEach((id) => next.add(id))
+      return next
+    })
+  }
+
+  const run = async (
+    action: 'delete' | 'cancel',
+    selection: IndexerFailureSelection,
+  ) => {
+    setMessage(null)
+    try {
+      if (action === 'delete') {
+        const result = await deleteFailures.mutateAsync(selection)
+        setMessage({
+          text:
+            `Queued ${result.queued} run(s) for deletion. The worker removes ` +
+            `their data in the background.` +
+            (result.errors?.length ? ` ${result.errors.join('; ')}` : ''),
+          isError: false,
+        })
+      } else {
+        const result = await cancelFailures.mutateAsync(selection)
+        setMessage({
+          text: `Took ${result.cancelled} run(s) out of the deletion queue.`,
+          isError: false,
+        })
+      }
+      setSelected(new Set())
+    } catch (err) {
+      setMessage({
+        text: err instanceof Error ? err.message : 'Request failed',
+        isError: true,
+      })
+    }
+  }
+
+  const deleteSelected = () => {
+    const runIds = [...selected]
+    if (runIds.length === 0) return
+    if (
+      !confirm(
+        `Delete the stored data of ${runIds.length} failed run(s)?\n\n` +
+          'This removes every file of those runs from storage. It cannot be undone.',
+      )
+    ) {
+      return
+    }
+    void run('delete', { runIds })
+  }
+
+  const deleteAll = () => {
+    if (
+      !confirm(
+        `Delete the stored data of all ${total} failed run(s)?\n\n` +
+          'This removes every file of those runs from storage. It cannot be undone.',
+      )
+    ) {
+      return
+    }
+    void run('delete', { all: true })
+  }
+
+  if (isLoading) {
+    return (
+      <div className="flex flex-col gap-8">
+        <IndexerPasses />
+        <div className="text-sm text-gray-500">Loading...</div>
+      </div>
+    )
+  }
+
+  if (error) {
+    return (
+      <div className="flex flex-col gap-8">
+        <IndexerPasses />
+        <div className="rounded-sm border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300">
+          {error instanceof Error ? error.message : 'Failed to load index failures'}
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div>
+      <IndexerPasses />
+
+      <h2 className="mt-8 mb-3 text-sm font-medium text-gray-700 dark:text-gray-300">
+        Runs the indexer cannot index
+      </h2>
+
+      <div className="mb-4 rounded-sm border border-gray-200 bg-gray-50 px-4 py-3 text-sm text-gray-600 dark:border-gray-700 dark:bg-gray-800/50 dark:text-gray-400">
+        Runs that storage holds but the indexer cannot index, usually because the
+        run directory never got its <code className="font-mono text-xs">config.json</code>.
+        A run is only recorded once it is old enough that an upload still in
+        flight is ruled out, and it is skipped by later passes until the retry
+        interval lapses. Deleting one removes its files from storage; the record
+        goes once that succeeds.
+      </div>
+
+      <div className="mb-4 flex flex-wrap items-center gap-3">
+        <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300">
+          {total} failed run{total !== 1 ? 's' : ''}
+          {selected.size > 0 && ` · ${selected.size} selected`}
+        </h3>
+
+        <div className="ml-auto flex items-center gap-2">
+          {selected.size > 0 && (
+            <button
+              onClick={deleteSelected}
+              disabled={busy}
+              className="flex items-center gap-1.5 rounded-sm bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {busy ? <Loader2 className="size-3.5 animate-spin" /> : <Trash2 className="size-3.5" />}
+              Delete selected
+            </button>
+          )}
+          {total > 0 && (
+            <button
+              onClick={deleteAll}
+              disabled={busy}
+              className="flex items-center gap-1.5 rounded-sm border border-red-300 px-3 py-1.5 text-sm font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950/40"
+            >
+              <AlertTriangle className="size-3.5" />
+              Delete all {total}
+            </button>
+          )}
+          <button
+            onClick={() => void run('cancel', { all: true })}
+            disabled={busy}
+            className="flex items-center gap-1.5 rounded-sm border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-50 disabled:opacity-50 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
+            title="Take every queued run back out of the deletion queue"
+          >
+            <Undo2 className="size-3.5" />
+            Cancel queued
+          </button>
+        </div>
+      </div>
+
+      {message && (
+        <div
+          className={clsx(
+            'mb-4 rounded-sm px-4 py-2 text-sm',
+            message.isError
+              ? 'bg-red-50 text-red-700 dark:bg-red-950/40 dark:text-red-300'
+              : 'bg-green-50 text-green-700 dark:bg-green-950/40 dark:text-green-300',
+          )}
+        >
+          {message.text}
+        </div>
+      )}
+
+      <div className="overflow-x-auto rounded-sm border border-gray-200 dark:border-gray-700">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-gray-50 text-xs text-gray-500 uppercase dark:bg-gray-800 dark:text-gray-400">
+            <tr>
+              <th className="w-10 px-4 py-2">
+                <input
+                  type="checkbox"
+                  checked={allOnPageSelected}
+                  onChange={togglePage}
+                  disabled={selectableOnPage.length === 0}
+                  aria-label="Select every run on this page"
+                  className="size-3.5 accent-blue-600"
+                />
+              </th>
+              <th className="px-4 py-2">Run</th>
+              <th className="px-4 py-2">Run time</th>
+              <th className="px-4 py-2">Discovery path</th>
+              <th className="px-4 py-2">Error</th>
+              <th className="px-4 py-2 text-right">Attempts</th>
+              <th className="px-4 py-2">Last attempt</th>
+              <th className="px-4 py-2">Status</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+            {entries.map((failure) => (
+              <IndexerFailureRow
+                key={`${failure.discovery_path}/${failure.run_id}`}
+                failure={failure}
+                selected={selected.has(failure.run_id)}
+                onToggle={() => toggleOne(failure.run_id)}
+              />
+            ))}
+            {entries.length === 0 && (
+              <tr>
+                <td colSpan={8} className="px-4 py-6 text-center text-sm text-gray-500 dark:text-gray-400">
+                  No failed runs. The indexer is keeping up.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {total > INDEXER_FAILURES_PAGE_SIZE && (
+        <div className="mt-3 flex items-center justify-end gap-2 text-sm text-gray-500 dark:text-gray-400">
+          <span>
+            {offset + 1}-{Math.min(offset + INDEXER_FAILURES_PAGE_SIZE, total)} of {total}
+          </span>
+          <button
+            onClick={() => setOffset((o) => Math.max(0, o - INDEXER_FAILURES_PAGE_SIZE))}
+            disabled={offset === 0}
+            className="rounded-sm border border-gray-300 p-1 disabled:opacity-40 dark:border-gray-700"
+            aria-label="Previous page"
+          >
+            <ChevronLeft className="size-3.5" />
+          </button>
+          <button
+            onClick={() => setOffset((o) => o + INDEXER_FAILURES_PAGE_SIZE)}
+            disabled={onLastPage}
+            className="rounded-sm border border-gray-300 p-1 disabled:opacity-40 dark:border-gray-700"
+            aria-label="Next page"
+          >
+            <ChevronRight className="size-3.5" />
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function IndexerFailureRow({
+  failure,
+  selected,
+  onToggle,
+}: {
+  failure: IndexerFailure
+  selected: boolean
+  onToggle: () => void
+}) {
+  const queued = Boolean(failure.deletion_requested_at)
+
+  return (
+    <tr className={clsx('bg-white dark:bg-gray-900', queued && 'opacity-60')}>
+      <td className="px-4 py-2">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggle}
+          disabled={queued}
+          aria-label={`Select ${failure.run_id}`}
+          className="size-3.5 accent-blue-600"
+        />
+      </td>
+      <td className="px-4 py-2">
+        <code className="rounded-xs bg-gray-100 px-1.5 py-0.5 font-mono text-xs text-gray-700 dark:bg-gray-800 dark:text-gray-300">
+          {failure.run_id}
+        </code>
+      </td>
+      <td className="px-4 py-2 whitespace-nowrap text-gray-500 dark:text-gray-400">
+        {formatRunTimestamp(failure.run_timestamp)}
+      </td>
+      <td className="px-4 py-2 text-gray-500 dark:text-gray-400">{failure.discovery_path}</td>
+      <td className="px-4 py-2 text-gray-500 dark:text-gray-400">{failure.error || '-'}</td>
+      <td className="px-4 py-2 text-right text-gray-500 dark:text-gray-400">{failure.attempts}</td>
+      <td className="px-4 py-2 whitespace-nowrap text-gray-500 dark:text-gray-400">
+        {formatTimestamp(failure.last_attempt_at)}
+      </td>
+      <td className="px-4 py-2">
+        {failure.deletion_error ? (
+          <span className="text-xs text-red-600 dark:text-red-400" title={failure.deletion_error}>
+            Delete failed, retrying
+          </span>
+        ) : queued ? (
+          <span className="text-xs text-amber-600 dark:text-amber-400">Queued for deletion</span>
+        ) : (
+          <span className="text-xs text-gray-400 dark:text-gray-500">Recorded</span>
+        )}
+      </td>
+    </tr>
+  )
+}
+
 // --- Config Overview ---
 
 function ConfigOverview({ config }: { config: AuthConfig }) {
   const s3 = config.storage?.s3
   const local = config.storage?.local
   const indexingEnabled = config.indexing?.enabled ?? false
-
-  const runIndexer = useRunIndexer()
-  const [indexerMessage, setIndexerMessage] = useState<{ text: string; isError: boolean } | null>(null)
-
-  const handleRunIndexer = async () => {
-    setIndexerMessage(null)
-    try {
-      const result = await runIndexer.mutateAsync()
-      setIndexerMessage({ text: result.message, isError: false })
-    } catch (err) {
-      setIndexerMessage({
-        text: err instanceof Error ? err.message : 'Failed to trigger indexer',
-        isError: true,
-      })
-    }
-  }
 
   const items: { label: string; enabled: boolean }[] = [
     { label: 'Basic Auth', enabled: config.auth.basic_enabled },
@@ -699,33 +1618,7 @@ function ConfigOverview({ config }: { config: AuthConfig }) {
             <span className="text-gray-700 dark:text-gray-300">{item.label}</span>
           </span>
         ))}
-        {indexingEnabled && (
-          <button
-            onClick={handleRunIndexer}
-            disabled={runIndexer.isPending}
-            className="flex items-center gap-1 rounded-sm border border-gray-300 px-2 py-0.5 text-xs font-medium text-gray-700 hover:bg-gray-200 disabled:opacity-50 dark:border-gray-600 dark:text-gray-300 dark:hover:bg-gray-700"
-          >
-            {runIndexer.isPending ? (
-              <Loader2 className="size-3 animate-spin" />
-            ) : (
-              <Play className="size-3" />
-            )}
-            Run Indexer
-          </button>
-        )}
       </div>
-      {indexerMessage && (
-        <div
-          className={clsx(
-            'mt-2 text-xs',
-            indexerMessage.isError
-              ? 'text-red-600 dark:text-red-400'
-              : 'text-green-600 dark:text-green-400',
-          )}
-        >
-          {indexerMessage.text}
-        </div>
-      )}
       {s3?.enabled && s3.discovery_paths.length > 0 && (
         <div className="mt-2 text-xs text-gray-500 dark:text-gray-400">
           S3 discovery paths: {s3.discovery_paths.join(', ')}

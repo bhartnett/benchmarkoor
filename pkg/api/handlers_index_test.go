@@ -1,18 +1,24 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/api/indexstore"
 	"github.com/ethpandaops/benchmarkoor/pkg/config"
+	"github.com/ethpandaops/benchmarkoor/pkg/executor"
 )
 
 func newIndexTestServer(t *testing.T) *server {
@@ -78,8 +84,12 @@ func TestHandleIndex_SplicesAndCaches(t *testing.T) {
 
 	// The build populated the cache for the current generation.
 	gen := s.indexStore.RunsGeneration()
-	require.NotNil(t, s.indexCacheBody)
-	assert.Equal(t, gen, s.indexCacheGen)
+	require.NotNil(t, s.indexCache)
+	assert.Equal(t, gen, s.indexCache.gen)
+	assert.NotEmpty(t, s.indexCache.etag)
+	assert.NotEmpty(t, s.indexCache.gzipped)
+	// Each encoding is a separate representation and needs its own validator.
+	assert.NotEqual(t, s.indexCache.etag, s.indexCache.gzipETag)
 
 	// A second request with no intervening writes is served from cache and
 	// returns byte-for-byte identical output.
@@ -116,4 +126,300 @@ func TestHandleIndex_MissingBlobs(t *testing.T) {
 	require.Len(t, resp.Entries, 1)
 	assert.JSONEq(t, `{}`, string(resp.Entries[0].Tests.Steps))
 	assert.Nil(t, resp.Entries[0].Metadata)
+}
+
+// TestHandleIndex_ETagRevalidation covers the conditional-request path: the
+// handler advertises an ETag, answers a matching If-None-Match with a bodyless
+// 304, and issues a new ETag once the generation moves on.
+func TestHandleIndex_ETagRevalidation(t *testing.T) {
+	s := newIndexTestServer(t)
+	ctx := context.Background()
+
+	require.NoError(t, s.indexStore.UpsertRun(ctx, &indexstore.Run{
+		DiscoveryPath: "dp", RunID: "run-1", Timestamp: 100,
+	}))
+
+	rec, _ := getIndex(t, s)
+
+	etag := rec.Header().Get("ETag")
+	require.NotEmpty(t, etag)
+	assert.Equal(t, "no-cache", rec.Header().Get("Cache-Control"))
+	assert.Contains(t, rec.Header().Values("Vary"), "Accept-Encoding")
+
+	// A poll carrying the current validator gets a 304 with no body.
+	notModified := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+	req.Header.Set("If-None-Match", etag)
+	s.handleIndex(notModified, req)
+
+	assert.Equal(t, http.StatusNotModified, notModified.Code)
+	assert.Empty(t, notModified.Body.Bytes())
+	assert.Equal(t, etag, notModified.Header().Get("ETag"))
+
+	// Indexing another run must invalidate the validator, otherwise a client
+	// would sit on a stale body forever.
+	require.NoError(t, s.indexStore.UpsertRun(ctx, &indexstore.Run{
+		DiscoveryPath: "dp", RunID: "run-2", Timestamp: 200,
+	}))
+
+	stale := httptest.NewRecorder()
+	staleReq := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+	staleReq.Header.Set("If-None-Match", etag)
+	s.handleIndex(stale, staleReq)
+
+	assert.Equal(t, http.StatusOK, stale.Code)
+	assert.NotEqual(t, etag, stale.Header().Get("ETag"))
+}
+
+// TestHandleIndex_ServesPrecompressedBody verifies the handler hands back the
+// cached gzip copy when the client accepts it, and the plain body otherwise.
+func TestHandleIndex_ServesPrecompressedBody(t *testing.T) {
+	s := newIndexTestServer(t)
+
+	require.NoError(t, s.indexStore.UpsertRun(context.Background(), &indexstore.Run{
+		DiscoveryPath: "dp", RunID: "run-1", Timestamp: 100, Client: "geth",
+	}))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	s.handleIndex(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "gzip", rec.Header().Get("Content-Encoding"))
+	assert.Equal(t, strconv.Itoa(rec.Body.Len()),
+		rec.Header().Get("Content-Length"))
+	assert.Equal(t, s.indexCache.gzipETag, rec.Header().Get("ETag"))
+
+	reader, err := gzip.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	require.NoError(t, err)
+
+	decoded, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+
+	var resp indexResponse
+	require.NoError(t, json.Unmarshal(decoded, &resp))
+	require.Len(t, resp.Entries, 1)
+	assert.Equal(t, "run-1", resp.Entries[0].RunID)
+
+	// A client that can't take gzip still gets readable JSON, under the
+	// validator of that representation.
+	plain, plainResp := getIndex(t, s)
+	assert.Empty(t, plain.Header().Get("Content-Encoding"))
+	assert.Equal(t, decoded, plain.Body.Bytes())
+	assert.Equal(t, s.indexCache.etag, plain.Header().Get("ETag"))
+	assert.NotEqual(t, rec.Header().Get("ETag"), plain.Header().Get("ETag"))
+	require.Len(t, plainResp.Entries, 1)
+}
+
+// TestHandleIndex_ETagIsPerEncoding guards RFC 9110 8.8.1: a strong entity tag
+// identifies one representation. A client that stops (or starts) accepting
+// gzip must not be told a body it has never received is unmodified.
+func TestHandleIndex_ETagIsPerEncoding(t *testing.T) {
+	s := newIndexTestServer(t)
+
+	require.NoError(t, s.indexStore.UpsertRun(context.Background(), &indexstore.Run{
+		DiscoveryPath: "dp", RunID: "run-1", Timestamp: 100,
+	}))
+
+	// Collect the validator each encoding hands out.
+	etags := make(map[string]string, 2)
+
+	for _, encoding := range []string{"", "gzip"} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+
+		if encoding != "" {
+			req.Header.Set("Accept-Encoding", encoding)
+		}
+
+		s.handleIndex(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+
+		etags[encoding] = rec.Header().Get("ETag")
+		require.NotEmpty(t, etags[encoding])
+	}
+
+	require.NotEqual(t, etags[""], etags["gzip"])
+
+	// Replaying a validator under the other encoding must return the body,
+	// not a 304.
+	crossed := []struct {
+		name      string
+		encoding  string
+		validator string
+	}{
+		{name: "identity tag on gzip request", encoding: "gzip", validator: etags[""]},
+		{name: "gzip tag on identity request", encoding: "", validator: etags["gzip"]},
+	}
+
+	for _, tt := range crossed {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+			req.Header.Set("If-None-Match", tt.validator)
+
+			if tt.encoding != "" {
+				req.Header.Set("Accept-Encoding", tt.encoding)
+			}
+
+			s.handleIndex(rec, req)
+
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.NotEmpty(t, rec.Body.Bytes())
+		})
+	}
+
+	// The matching pair still revalidates, and a 304 carries no encoding
+	// because it carries no body.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	req.Header.Set("If-None-Match", etags["gzip"])
+	s.handleIndex(rec, req)
+
+	assert.Equal(t, http.StatusNotModified, rec.Code)
+	assert.Empty(t, rec.Header().Get("Content-Encoding"))
+	assert.Empty(t, rec.Body.Bytes())
+}
+
+// TestHandleIndex_CompressMiddlewareDoesNotReEncode guards the reason the
+// handler compresses at all: it must set Content-Encoding so chi's Compress
+// middleware passes the cached bytes through instead of gzipping them again.
+func TestHandleIndex_CompressMiddlewareDoesNotReEncode(t *testing.T) {
+	s := newIndexTestServer(t)
+	s.cfg = &config.APIConfig{}
+	s.cfg.Auth.AnonymousRead = true
+
+	require.NoError(t, s.indexStore.UpsertRun(context.Background(), &indexstore.Run{
+		DiscoveryPath: "dp", RunID: "run-1", Timestamp: 100,
+	}))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/index", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	s.buildRouter().ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "gzip", rec.Header().Get("Content-Encoding"))
+
+	// One round of decoding must yield JSON. A second encoding layer would
+	// leave gzip magic bytes here instead.
+	reader, err := gzip.NewReader(bytes.NewReader(rec.Body.Bytes()))
+	require.NoError(t, err)
+
+	decoded, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.NoError(t, reader.Close())
+
+	var resp indexResponse
+	require.NoError(t, json.Unmarshal(decoded, &resp))
+	assert.Len(t, resp.Entries, 1)
+}
+
+func TestAcceptsGzip(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+		want   bool
+	}{
+		{name: "absent", header: "", want: false},
+		{name: "bare token", header: "gzip", want: true},
+		{name: "browser list", header: "gzip, deflate, br, zstd", want: true},
+		{name: "mixed case", header: "GZip", want: true},
+		{name: "with quality", header: "gzip;q=0.8", want: true},
+		{name: "refused", header: "gzip;q=0", want: false},
+		{name: "refused with spaces", header: "deflate, gzip; q=0", want: false},
+		{name: "other encodings only", header: "deflate, br", want: false},
+		{name: "not a prefix match", header: "x-gzip", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			if tt.header != "" {
+				req.Header.Set("Accept-Encoding", tt.header)
+			}
+
+			assert.Equal(t, tt.want, acceptsGzip(req))
+		})
+	}
+}
+
+func TestETagMatches(t *testing.T) {
+	const etag = `"abc123"`
+
+	tests := []struct {
+		name        string
+		ifNoneMatch string
+		want        bool
+	}{
+		{name: "absent", ifNoneMatch: "", want: false},
+		{name: "exact", ifNoneMatch: etag, want: true},
+		{name: "weak", ifNoneMatch: `W/"abc123"`, want: true},
+		{name: "wildcard", ifNoneMatch: "*", want: true},
+		{name: "in list", ifNoneMatch: `"other", "abc123"`, want: true},
+		{name: "mismatch", ifNoneMatch: `"other"`, want: false},
+		{name: "unquoted", ifNoneMatch: "abc123", want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, etagMatches(tt.ifNoneMatch, etag))
+		})
+	}
+}
+
+// The suite stats endpoint turns a rejected row back into the stats.json
+// shape: the time to reject is rejected_time_ns, apart from the gas time.
+func TestHandleSuiteStats_RejectedTest(t *testing.T) {
+	s := newIndexTestServer(t)
+	ctx := context.Background()
+
+	// The query picks the suite's recent runs from the runs table.
+	require.NoError(t, s.indexStore.UpsertRun(ctx, &indexstore.Run{
+		DiscoveryPath: "dp",
+		RunID:         "run-1",
+		Timestamp:     100,
+		SuiteHash:     "suite",
+		Status:        "completed",
+		Client:        "geth",
+	}))
+	require.NoError(t, s.indexStore.ReplaceTestStats(ctx, "run-1", []*indexstore.TestStat{{
+		SuiteHash:    "suite",
+		RunID:        "run-1",
+		TestName:     "invalid",
+		Client:       "geth",
+		RunStart:     100,
+		TotalGasUsed: 10_000_000,
+		TotalTimeNs:  80_000_000,
+		TotalMGasS:   500,
+		SetupGasUsed: 10_000_000,
+		SetupTimeNs:  20_000_000,
+		// A rejected payload in each step.
+		SetupRejectedTimeNs: 13_000_000,
+		TestRejectedTimeNs:  47_000_000,
+	}}))
+
+	rctx := chi.NewRouteContext()
+	rctx.URLParams.Add("hash", "suite")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/suites/suite/stats", nil)
+	req = req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, rctx))
+	rec := httptest.NewRecorder()
+	s.handleSuiteStats(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	var stats executor.SuiteStats
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &stats))
+	require.Contains(t, stats, "invalid")
+	require.Len(t, stats["invalid"].Durations, 1)
+
+	d := stats["invalid"].Durations[0]
+	assert.Equal(t, int64(20_000_000), d.Time)
+	assert.Equal(t, int64(60_000_000), d.RejectedTime)
+	assert.Equal(t, int64(0), d.Steps.Test.Time)
+	assert.Equal(t, int64(47_000_000), d.Steps.Test.RejectedTime)
+	assert.Equal(t, int64(20_000_000), d.Steps.Setup.Time)
+	assert.Equal(t, int64(13_000_000), d.Steps.Setup.RejectedTime)
 }

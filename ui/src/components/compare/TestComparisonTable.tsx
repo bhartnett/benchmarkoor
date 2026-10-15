@@ -7,7 +7,9 @@ import { type StepTypeOption, getAggregatedStats } from '@/pages/RunDetailPage'
 import { Pagination } from '@/components/shared/Pagination'
 import { TestName } from '@/components/shared/TestName'
 import { compareOptional } from '@/components/run-detail/block-logs-dashboard/hooks/useProcessedData'
+import { formatDuration } from '@/utils/format'
 import { type CompareRun, type LabelMode, RUN_SLOTS, formatRunLabel } from './constants'
+import { isRejectedOnly, payloadTimeNs } from './compareMetrics'
 
 interface TestComparisonTableProps {
   runs: CompareRun[]
@@ -39,6 +41,9 @@ interface ComparedTest {
   gasUsed: number | undefined
   values: (number | undefined)[]
   avgValue: number | undefined
+  // Per run: the time the client took to reject the test's payloads, when
+  // all of them are payloads it must reject (they have no MGas/s).
+  rejectedTimes: (number | undefined)[]
 }
 
 interface MetricTab {
@@ -95,6 +100,13 @@ function calculateMGasPerSec(stats: AggregatedStats | undefined): number | undef
   return (stats.gas_used_total * 1000) / stats.gas_used_time_total
 }
 
+/** Where a metric comes from, for the tab tooltip. */
+function tabTitle(id: string): string | undefined {
+  if (id.startsWith('bl-')) return 'Extracted from block logs'
+  if (id === 'duration') return 'Total engine_newPayload time of the test'
+  return undefined
+}
+
 function SortIcon({ direction, active }: { direction: SortDirection; active: boolean }) {
   return (
     <svg
@@ -148,6 +160,7 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
   const tabs: MetricTab[] = useMemo(() => {
     const base: MetricTab[] = [
       { id: 'mgas', label: 'MGas/s', unit: 'MGas/s', higherIsBetter: true, format: (v) => v >= 100 ? v.toFixed(0) : v.toFixed(2) },
+      { id: 'duration', label: 'Duration', unit: 'time', higherIsBetter: false, format: formatDuration },
     ]
     if (hasBlockLogs) {
       return [...base, ...BLOCK_LOG_METRICS]
@@ -167,8 +180,11 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
 
   const comparedTests = useMemo(() => {
     const allTestNames = new Set<string>()
+    // Both run metrics read the test results; every other tab reads the
+    // block logs.
+    const isRunMetric = activeTab === 'mgas' || activeTab === 'duration'
 
-    if (activeTab === 'mgas') {
+    if (isRunMetric) {
       for (const run of runs) {
         if (run.result) {
           for (const name of Object.keys(run.result.tests)) allTestNames.add(name)
@@ -185,13 +201,17 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
     const tests: ComparedTest[] = []
     for (const name of allTestNames) {
       const values: (number | undefined)[] = []
+      const rejectedTimes: (number | undefined)[] = []
       let order = suiteOrder.get(name) ?? 0
 
-      if (activeTab === 'mgas') {
+      if (isRunMetric) {
         for (const run of runs) {
           const entry = run.result?.tests[name]
           const stats = entry ? getAggregatedStats(entry, stepFilter) : undefined
-          values.push(calculateMGasPerSec(stats))
+          // Total engine_newPayload time (or time to reject), in ns: the
+          // same number the performance heatmap colours.
+          values.push(activeTab === 'mgas' ? calculateMGasPerSec(stats) : payloadTimeNs(stats))
+          rejectedTimes.push(isRejectedOnly(stats) ? payloadTimeNs(stats) : undefined)
           if (order === 0 && entry) {
             order = parseInt(entry.dir, 10) || 0
           }
@@ -222,7 +242,7 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
         }
       }
 
-      tests.push({ name, order, gasUsed, values, avgValue })
+      tests.push({ name, order, gasUsed, values, avgValue, rejectedTimes })
     }
     return tests
   }, [runs, suiteOrder, stepFilter, activeTab, blockLogsPerRun])
@@ -298,7 +318,7 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
             <button
               key={tab.id}
               onClick={() => { setActiveTab(tab.id); setCurrentPage(1) }}
-              title={tab.id.startsWith('bl-') ? 'Extracted from block logs' : undefined}
+              title={tabTitle(tab.id)}
               className={clsx(
                 'shrink-0 border-b-2 px-3 py-2 text-xs/5 font-medium transition-colors',
                 activeTab === tab.id
@@ -422,7 +442,7 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
                       ? (activeMetric.higherIsBetter ? val - refValue : refValue - val)
                       : undefined
                     return (
-                      <td key={RUN_SLOTS[i].label} className="whitespace-nowrap px-4 py-2 text-right text-sm/6">
+                      <td key={RUN_SLOTS[runs[i].index].label} className="whitespace-nowrap px-4 py-2 text-right text-sm/6">
                         {val !== undefined ? (
                           <Link
                             to="/runs/$runId"
@@ -440,6 +460,17 @@ export function TestComparisonTable({ runs, suiteTests, stepFilter, blockLogsPer
                                 {' '}({diff >= 0 ? '+' : '-'}{((Math.abs(diff) / refValue!) * 100).toFixed(1)}%)
                               </div>
                             )}
+                          </Link>
+                        ) : test.rejectedTimes[i] !== undefined ? (
+                          <Link
+                            to="/runs/$runId"
+                            params={{ runId: runs[i].runId }}
+                            search={{ testModal: test.name }}
+                            target="_blank"
+                            className="block text-blue-600 hover:underline dark:text-blue-400"
+                            title="The client rejected this invalid payload as expected. There is no MGas/s for a rejected payload; this is its time to reject."
+                          >
+                            rejected in {formatDuration(test.rejectedTimes[i]!)}
                           </Link>
                         ) : (
                           <div className="text-gray-500 dark:text-gray-400">-</div>

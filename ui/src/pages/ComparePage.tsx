@@ -16,7 +16,7 @@ import { CompareDimensionInsights } from '@/components/compare/CompareDimensionI
 import { CompareHeader } from '@/components/compare/CompareHeader'
 import { StickyRunBar } from '@/components/compare/StickyRunBar'
 import { MetricsComparison } from '@/components/compare/MetricsComparison'
-import { MGasComparisonChart } from '@/components/compare/MGasComparisonChart'
+import { TestMetricChart } from '@/components/compare/TestMetricChart'
 import { type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
 import { PercentageDiffChart } from '@/components/compare/PercentageDiffChart'
 import { TestComparisonTable } from '@/components/compare/TestComparisonTable'
@@ -25,6 +25,7 @@ import { BlockLogsComparison } from '@/components/compare/BlockLogsComparison'
 import { ConfigDiff } from '@/components/compare/ConfigDiff'
 import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER } from '@/pages/RunDetailPage'
 import { MIN_COMPARE_RUNS, MAX_COMPARE_RUNS, buildLabelModeOptions, type CompareRun, type LabelMode } from '@/components/compare/constants'
+import { fixtureGasByTest, testGasForFilter } from '@/components/compare/compareMetrics'
 
 function parseStepFilter(param: string | undefined): StepTypeOption[] {
   if (!param) return DEFAULT_STEP_FILTER
@@ -154,14 +155,15 @@ export function ComparePage() {
     // same across compared runs (same suite).
     const result = resultQueries.find((q) => q.data)?.data
     if (!result) return map
+    const fixtureGas = fixtureGasByTest(suite?.tests)
     for (const [name, entry] of Object.entries(result.tests)) {
       const step = entry.steps?.test
       if (step) {
-        map.set(name, step.aggregated.gas_used_total)
+        map.set(name, testGasForFilter(step.aggregated, fixtureGas.get(name)))
       }
     }
     return map
-  }, [resultQueries])
+  }, [resultQueries, suite?.tests])
 
   // Available gas buckets sorted ascending. Shown as chips.
   const availableGasBuckets = useMemo(() => {
@@ -472,7 +474,11 @@ export function ComparePage() {
       <MetricsComparison runs={runs} stepFilter={stepFilter} baselineIdx={baselineIdx} onBaselineChange={setBaselineIdx} labelMode={labelMode} testNameFilter={testNameFilter} />
 
       {allResults && (
-        <MGasComparisonChart runs={runs} suiteTests={suite?.tests} stepFilter={stepFilter} labelMode={labelMode} testNameFilter={testNameFilter} zoomRange={sharedZoom ? chartZoom : undefined} onZoomChange={sharedZoom ? setChartZoom : undefined} chartType={chartType} />
+        <TestMetricChart runs={runs} suiteTests={suite?.tests} stepFilter={stepFilter} labelMode={labelMode} testNameFilter={testNameFilter} zoomRange={sharedZoom ? chartZoom : undefined} onZoomChange={sharedZoom ? setChartZoom : undefined} chartType={chartType} />
+      )}
+
+      {allResults && (
+        <TestMetricChart runs={runs} suiteTests={suite?.tests} stepFilter={stepFilter} labelMode={labelMode} testNameFilter={testNameFilter} zoomRange={sharedZoom ? chartZoom : undefined} onZoomChange={sharedZoom ? setChartZoom : undefined} chartType={chartType} metric="duration" />
       )}
 
       {allResults && (

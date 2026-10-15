@@ -134,6 +134,7 @@ runner:
     tmp_datadir: /tmp/benchmarkoor
   drop_caches_path: /proc/sys/vm/drop_caches
   cpu_sysfs_path: /sys/devices/system/cpu
+  cgroup_path: /sys/fs/cgroup
 ```
 
 ### Options
@@ -147,10 +148,12 @@ runner:
 | `run_timeout` | string | - | Global timeout for the entire run covering all instances, setup, and teardown. Uses Go duration format (e.g., `4h`, `30m`). See [Runner Run Timeout](#runner-run-timeout) |
 | `directories.tmp_datadir` | string | system temp | Directory for temporary datadir copies. (The shared cache dir is `global.directories.cachedir`.) |
 | `drop_caches_path` | string | `/proc/sys/vm/drop_caches` | Path to Linux drop_caches file (for containerized environments) |
+| `cgroup_path` | string | `/sys/fs/cgroup` | Mount point of the host cgroup v2 hierarchy. The `io.cost` disk throttle writes `io.cost.model` and `io.cost.qos` here. See [io.cost](#iocost-one-budget-for-reads-and-writes) |
 | `cpu_sysfs_path` | string | `/sys/devices/system/cpu` | Base path for CPU sysfs files (for containerized environments where `/sys` is read-only and the host path is bind-mounted elsewhere, e.g., `/host_sys_cpu`) |
 | `metadata.labels` | map[string]string | - | Arbitrary key-value labels attached to the run (see [Metadata Labels](#metadata-labels)) |
 | `github_token` | string | - | GitHub token for downloading Actions artifacts via REST API. Not needed if `gh` CLI is installed and authenticated. Requires `actions:read` scope. Can also be set via `BENCHMARKOOR_RUNNER_GITHUB_TOKEN` env var |
 | `live_reporting` | object | - | Stream periodic run-status reports to a benchmarkoor API instance so the UI can display in-progress runs. See [Live Reporting](#live-reporting) |
+| `storage_probe` | object | - | Measure the IOPS, bandwidth and QD1 latency of the datadir block device before the first client starts. See [Storage Probe](#storage-probe) |
 
 #### Live Reporting
 
@@ -605,6 +608,17 @@ tests:
 - Converts EEST fixture format to `engine_newPayloadV{1-4}` + `engine_forkchoiceUpdatedV{1,3}` calls
 - Only includes fixtures with `fixture-format: blockchain_test_engine_x`
 - Auto-resolves genesis files per client type from the release/artifact/local source
+
+**Invalid payloads:**
+
+A fixture marks a payload that the client must reject with `validationError` (and, as an option, `errorCode`) on its `engineNewPayloads` entry. For such a payload, benchmarkoor does these steps:
+
+- It sends the `engine_newPayload` call, but no `engine_forkchoiceUpdated` call. The head stays on the parent block.
+- It passes the call when the client answers `INVALID`, or the JSON-RPC error in `errorCode`. It fails the call on `VALID`, `INVALID_BLOCK_HASH`, `SYNCING` or `ACCEPTED`.
+- It does not retry the call. A client keeps a list of bad blocks and answers a resend at once, so a retry measures nothing.
+- It records the time to reject the payload, but no gas used and no MGas/s. The client can stop part way through the block, and the header `gasUsed` can be the corrupted field. The `rejected` list in `<step>.result-details.json` holds the positions of these calls.
+
+EEST writes the real gas of the benchmark transactions to `_info.metadata.benchmark_gas_used`.
 
 **Genesis file resolution:**
 
@@ -1147,6 +1161,18 @@ Only clients that ship an offline compaction command support this. Today that is
 
 > **On erigon, `before_benchmarks` needs `--exec.no-prune` on the instance.** That phase stops and restarts the client, and erigon refuses to reopen a datadir whose receipt domain it pruned past the snapshot files: `[snapshots] gap between snapshot files and DB for domain receipt: files end at txNum 0 but the DB was pruned up to 390625`. A synthetic snapshot has no snapshot files, so the client's own pruning is enough to create the gap. `--exec.no-prune` disables the state-aggregator pruning that advances the marker. Erigon documents the flag for diagnostic and perf-comparison use, which is what a benchmark is, and it removes housekeeping the benchmark does not want anyway. `before_pre_runs` needs no flag: it compacts before the client ever boots, so nothing restarts.
 
+###### Outside a run: `benchmarkoor db compact`
+
+Run the same client-provided maintenance commands against a stopped host datadir without a benchmark config:
+
+```bash
+benchmarkoor db compact --client geth --datadir /path/to/datadir --image ethereum/client-go:v1.17.7
+```
+
+Only Geth and Erigon are supported. Other clients return an error; benchmarkoor does not use generic database tools or replace database files itself. Select the image version that wrote the datadir with `--image`; the default is the client's default image. The client must be stopped before running this command.
+
+`--prepare`, `--extra-arg`, `--timeout` and `--no-inspect` use the same settings as a run's compaction phase. Container output goes to stdout. Preparation or compaction failures return a non-zero exit status; inspection failures remain warnings, as in a run. No run marker or report is written.
+
 ###### Preparation steps (`prepare`)
 
 A client can offer steps that run before the compaction to make it reclaim more. None run unless `prepare` names them, because a step that helps one datadir can ruin another.
@@ -1569,7 +1595,7 @@ Merge rules:
 
 - A field that the instance omits keeps the global value.
 - `cpuset` and `cpuset_count` are one setting. An instance that sets either one replaces both global fields.
-- Each `blkio_config` device list is replaced as a whole. An instance `device_read_bps` list does not change the global `device_write_bps` list.
+- Each `device_*` limit merges on its own, as the other fields do.
 - Set `swap_disabled: false` on the instance to turn swap on again when the global config disables it.
 
 ```yaml
@@ -1579,19 +1605,10 @@ resource_limits:
   cpuset: [0, 1, 2, 3]
   memory: "16g"
   swap_disabled: true
-  blkio_config:
-    device_read_bps:
-      - path: /dev/sdb
-        rate: '12mb'
-    device_write_bps:
-      - path: /dev/sdb
-        rate: '1024k'
-    device_read_iops:
-      - path: /dev/sdb
-        rate: '120'
-    device_write_iops:
-      - path: /dev/sdb
-        rate: '30'
+  device_read_iops: 50000
+  device_write_iops: 15000
+  device_read_bps: "500mb"
+  device_write_bps: "500mb"
 ```
 
 | Option | Type | Description |
@@ -1604,7 +1621,12 @@ resource_limits:
 | `cpu_freq_governor` | string | CPU frequency governor. Common values: `performance`, `powersave`, `schedutil`. Defaults to `performance` when `cpu_freq` is set |
 | `memory` | string | Memory limit with unit: `b`, `k`, `m`, `g` (e.g., `"16g"`, `"4096m"`) |
 | `swap_disabled` | bool | Disable swap (sets memory-swap equal to memory, swappiness to 0) |
-| `blkio_config` | object | Block I/O throttling configuration (see below) |
+| `device_read_iops` | uint | Read IOPS limit on the datadir block device. See [Disk I/O Limits](#disk-io-limits) |
+| `device_write_iops` | uint | Write IOPS limit on the datadir block device |
+| `device_read_bps` | string | Read bandwidth limit on the datadir block device, with a unit: `b`, `k`, `m`, `g` (e.g., `"500mb"`) |
+| `device_write_bps` | string | Write bandwidth limit on the datadir block device, with a unit |
+| `device_path` | string | Block device for the `device_*` limits, e.g. `/dev/nvme0n1`. Omit it to use the device that holds the datadir |
+| `device_throttle` | string | How the `device_*` limits throttle the disk: `io.max` (default) or `io.cost`. See [io.cost](#iocost-one-budget-for-reads-and-writes) |
 
 **Note:** `cpuset_count` and `cpuset` are mutually exclusive. Use one or the other.
 
@@ -1626,23 +1648,117 @@ resource_limits:
 
 The topology comes from sysfs (`/sys/devices/system/cpu/*/topology`), so `full_cores` and `one_thread_per_core` only work on Linux. The run's `config.json` records the host topology in `system.cpu_topology`, and the UI draws the pinned threads per physical core in the Configuration section.
 
-### Block I/O Configuration
+### Disk I/O Limits
 
-The `blkio_config` option allows throttling container disk I/O:
+The `device_*` limits throttle the block device that holds the client datadir. You do not usually set a device path. Before the client starts, benchmarkoor finds the device:
 
-| Option | Type | Description |
-|--------|------|-------------|
-| `device_read_bps` | []object | Device read bandwidth limits |
-| `device_read_iops` | []object | Device read IOPS limits |
-| `device_write_bps` | []object | Device write bandwidth limits |
-| `device_write_iops` | []object | Device write IOPS limits |
+1. It takes the host path of the data mount. For a Docker or Podman volume, this is the volume mountpoint.
+2. It reads the device number of that filesystem. It follows an overlay mount to its upper directory, and a btrfs subvolume to its source device.
+3. It goes from a partition to its whole disk. The kernel does not throttle a single partition.
 
-Each device entry has:
+Use the limits to give each client the disk of a reference machine. For example, these values match the storage recommendations of [EIP-7870](https://eips.ethereum.org/EIPS/eip-7870):
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `path` | string | Device path (e.g., `/dev/sdb`) |
-| `rate` | string | Rate limit. For `*_bps`: string with unit (`b`, `k`, `m`, `g`). For `*_iops`: integer string |
+```yaml
+runner:
+  client:
+    config:
+      resource_limits:
+        device_read_iops: 50000
+        device_write_iops: 15000
+        device_read_bps: "500mb"
+        device_write_bps: "500mb"
+```
+
+Notes:
+
+- The limits work only on Linux. They use the cgroup `io` controller through Docker or Podman.
+- On cgroup v2, the kernel also throttles buffered writes when it writes them back. On cgroup v1, only direct and synchronous writes are throttled. benchmarkoor logs a warning on a cgroup v1 host.
+- The `zfs` and `fuse-overlayfs` datadir methods do not support the limits. The disk I/O of these methods does not run in the container cgroup, so the config validation rejects them.
+- The limits apply to the whole disk. On a device-mapper or md device (LVM, RAID), they apply to that device.
+- The unit `mb` is a mebibyte (1,048,576 bytes), as in Docker. Thus `"500mb"` is 524 MB/s.
+- Set `device_path` when benchmarkoor cannot find the device, for example when it runs in a container that does not see the data mount. The path must be the device on the host of the container runtime. With `device_path`, benchmarkoor does not check that this device holds the datadir.
+- The `blkio_config` option was removed. A config that still sets it fails validation.
+- The run `config.json` records the throttled device in `instance.resource_limits.device_path`, and the rates in bytes per second or IOPS.
+
+#### io.cost: one budget for reads and writes
+
+By default (`device_throttle: io.max`), each limit is a separate cap. Reads and writes do not share capacity, so a mixed workload can use the full read limit and the full write limit at the same time. A real disk cannot do this.
+
+With `device_throttle: io.cost`, benchmarkoor uses the cgroup v2 `io.cost` controller. The `device_*` values become a model of a reference disk, and reads and writes take device time from one budget:
+
+```yaml
+resource_limits:
+  device_throttle: io.cost
+  # The read peaks of a Samsung 970 EVO Plus 2TB.
+  device_read_iops: 630000
+  device_read_bps: "3408mb"
+  # No write limits: writes then use almost none of the budget.
+```
+
+Before the client starts, benchmarkoor writes the model to `io.cost.model` and fixes the device rate at 100% in `io.cost.qos`. After the instance, it puts back the original settings. A direction without limits gets a very high capacity, so its I/O costs almost nothing. The IOPS values apply to sequential and random I/O.
+
+Choose the mode from the reference disk:
+
+- A disk that does more total throughput in a mixed workload than in one direction does not fit one shared budget. Set limits only for the direction that must be slower, as in the example. In a test against a 970 EVO Plus, this matched the reference disk better than `io.max`.
+- `io.max` on a device-mapper device can limit 1M sequential reads far below the configured `rbps`. `io.cost` does not have this problem.
+
+Notes:
+
+- `io.cost` applies to **all** I/O on the disk, from all processes on the host, not only to the client container. A datadir rollback (for example `schelk recover`) during the run is throttled too.
+- I/O from the root cgroup, for example from kernel threads, is not throttled. Thus the `zfs` datadir method does not work with `io.cost` either.
+- `io.cost` works only on a whole blk-mq disk, such as an NVMe or SCSI disk. benchmarkoor follows a device-mapper or md device to the disk under it. A stack over more than one disk (for example md RAID0) fails. Set `device_path` to one whole disk in that case.
+- benchmarkoor must have write access to the host `io.cost.model` and `io.cost.qos` files. Run it as root. In a container, use the host cgroup namespace and mount the host cgroup hierarchy writable, and set `runner.cgroup_path` to that mount.
+- Instances use the disk one after the other, so each instance can have its own model.
+- benchmarkoor saves the original settings in a state file in the cache directory. If the process is killed, the next run, or the `benchmarkoor cleanup` command, restores them.
+- The run `config.json` records `device_throttle`, the disk in `device_path`, and the written model line in `device_cost_model`.
+
+### Storage Probe
+
+The storage probe measures the capacity of the datadir block device, before the first client starts. It runs outside any container, so it shows the host device without throttles. The UI shows the results in the **Storage** part of the System section, next to the container limits and the EIP-7870 recommendations.
+
+```yaml
+runner:
+  storage_probe:
+    enabled: true
+    file_size: 4GB   # size of the test file
+    duration: 5s     # time of each QD1 workload
+    io_depth: 64     # I/O operations in flight
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `enabled` | bool | `false` | Run the probe |
+| `file_size` | string | `4GB` | Size of the test file. The minimum is `64MB` |
+| `duration` | string | `5s` | Time of each of the 2 QD1 workloads |
+| `io_depth` | int | `64` | Number of I/O operations in flight in the EIP-7870 workloads (1-1024) |
+
+The probe uses direct I/O (`O_DIRECT`), which bypasses the page cache:
+
+1. It writes the test file with random data.
+2. It measures 4 KiB random reads at QD1 (one I/O in flight): the IOPS, and the p50 and p99 latency.
+3. It measures 4 KiB random writes at QD1 in the same way. The writes do not use `fsync`.
+4. It measures 4 KiB random I/O at `io_depth`, with 75% reads and 25% writes in one run.
+5. It measures 1 MiB sequential I/O at `io_depth`, with 50% reads and 50% writes in one run.
+6. It deletes the test file.
+
+Steps 4 and 5 use the method of the EIP-7870 fio commands (`--ioengine=libaio --iodepth=64 --size=4G`, with `--rw=randrw --rwmixread=75` and `--rw=readwrite`):
+
+- One thread keeps `io_depth` I/Os in flight with Linux native AIO, and it submits one I/O for each `io_submit` call, as fio does by default.
+- Each I/O is a read or a write at random, with the given share of reads. A sequential run keeps one offset for reads and one for writes.
+- A run stops after `file_size` bytes of reads and writes, as fio `--size` does, or after 2 minutes on a very slow disk.
+
+The read and write values of each step come from the same run, and the UI compares them with the EIP-7870 recommendations. On a fast drive, the CPU time of the one thread can limit the result, as it does for fio. Thus these values can be lower than the drive datasheet. Probes before this change ran separate read and write workloads on 64 threads, so their values are higher. The UI marks them.
+
+The QD1 values show the latency of the drive. A client reads state mostly one key at a time, so QD1 is closer to the client workload than a deep queue. For reference, a consumer NVMe drive lists about 15,000 random read IOPS and 50,000 random write IOPS at QD1. The container limits do not change the QD1 values, because a limit caps the rate and does not add latency.
+
+Notes:
+
+- The probe runs once for each device and filesystem in a benchmarkoor process. Later instances on the same filesystem use the same result.
+- The probe writes its file into the data mount (for `overlayfs`, next to the upper directory). With the `direct` and `schelk` methods, this is the source datadir. benchmarkoor deletes the file, but schelk then has more blocks to restore.
+- A small test file can fit in the drive cache, and then the result is too high. Use a file that is larger than the drive cache for a more accurate result.
+- A failed probe does not stop the run. The error goes into `config.json` and the UI.
+
+The device details come from sysfs and do not need the probe. The run `config.json` records them in `system.storage`: the device path, type, model, size, filesystem, I/O scheduler, block sizes, and the backing disks of a device-mapper or md device. With `schelk`, the backing disks include a RAM disk (`ram0`). It holds the dm-era metadata, not the data, so the probe does not measure it.
 
 ### CPU Frequency Management
 
@@ -2011,9 +2127,11 @@ builder:
 
 1. Builds a **funding block** crediting `funding_accounts` (and any `funding_pools`) via beacon withdrawals.
 2. Optionally runs a **`predeploy`**: deploys the target fork's system contracts while the chain is still on the *pre*-fork.
-3. **Gas-bumps** with empty blocks until the head gas limit reaches `gas_limit` (default 1 TGas), capped by `gas_bump_max_blocks`.
-4. Runs `fill-stateful --no-reset-between-tests` on the configured setup `tests`, so deployed state persists across them.
+3. **Gas-bumps** with empty blocks until the head gas limit reaches `gas_limit` (default 1 TGas), capped by `gas_bump_max_blocks`. A `gas_limit` below the head's ramps it **down**, which needs Amsterdam blocks (the `targetGasLimit` payload attribute overrides the filler's miner ceiling); it fails on the first block otherwise.
+4. Runs `fill-stateful --no-reset-between-tests` on the configured setup `tests`, so deployed state persists across them. With `fill: false` this step is skipped and `tests` is not needed: the pre-run is just the funding block and the gas ramp, e.g. to walk a released head's 1 TGas back down to a realistic limit.
 5. Writes `<bundle_dir>/pre_run_bundle/pre-run.request` plus a `pre-run.meta.json` sidecar describing it.
+
+The filler then gets **15 minutes** to stop on its own — geth persists its journal and waits for its background indexers, nethermind flushes its state db — and a filler that had to be killed **fails the target**: the datadir is the pre-run's product (promoted, exported or read as `output_dir`) and may be incomplete. The bundle is written before the stop and is unaffected.
 
 Only `geth`, `besu` and `nethermind` can act as the filler. A target with `replay_from` set instead *consumes* a bundle: it boots any client (including non-fillers like reth/ethrex/nimbus, since replay only needs the engine API) and replays the recorded payloads onto its own snapshot.
 
@@ -2050,13 +2168,15 @@ builder:
 |---|---|---|---|
 | `filler_client` | string | – | `geth`, `besu` or `nethermind`. Replay targets may use any bootable client. |
 | `source_dir` | string | – | Snapshot datadir to advance. Absolute. |
-| `output_dir` | string | – | Where the advanced datadir is written. Not used (and not required) when `datadir_method: schelk`, which advances `source_dir` in place. |
+| `output_dir` | string | – | Where the advanced datadir is written. Not used (and not required) when `datadir_method: schelk`, which advances `source_dir` in place. With `datadir_method: zfs` it becomes a **persistent ZFS clone** of `source_dir` instead of a copy: O(1), the source is never written, and the clone (`<dataset>/prerun-<id>`, outside the orphan-cleanup patterns) holds the advanced datadir until a forced re-run replaces it. `source_dir` must then be a dataset's mountpoint. Every other method copies `source_dir` first. |
 | `bundle_dir` | string | `output_dir`, else `source_dir` | Where the replay bundle is written (as `<dir>/pre_run_bundle/`). **A schelk target needs this**: the advanced datadir is the copy-on-write scratch, and the next `schelk restore` — including the one the runner performs before replaying — discards anything on it, bundle included. |
 | `replay_from` | string | – | Makes this a *replay* target: instead of filling, it replays another target's bundle (by target name) or a path to a `.request` file / `pre_run_bundle` directory. |
+| `base_bundle` | string | – | Path to a prior pre-run's bundle, replayed first for either a filler or replay target. The target then builds new blocks or consumes `replay_from`. A newly produced bundle contains only the new blocks and must be replayed after its base. |
 | `genesis` | string | – | Boot genesis for the filler. Local path or http(s) URL. |
 | `genesis_fork_override` | map | – | Schedules forks by name (`{amsterdam: <ts>}`) in a **geth-format** genesis. |
 | `genesis_eip_override` | object | – | Schedules per-EIP transitions at a timestamp in a **parity/nethermind chainspec**. |
-| `gas_limit` | uint | `1000000000000` | Gas-bump target. |
+| `gas_limit` | uint | `1000000000000` | Gas-bump target. Below the head's gas limit it ramps down (Amsterdam only). |
+| `fill` | bool | `true` | Run the `fill-stateful` step. `false` makes `tests` optional and records only the funding block and gas ramp. Hoistable from `config`. |
 | `gas_bump_max_blocks` | int | `20000` | Safety cap on empty gas-bump blocks. |
 | `funding_accounts` | list | – | Addresses credited in the funding block. Empty skips the block. |
 | `funding_pools` | list | – | Credits a derived sender pool (`base_key_seed` + `count`), matching EEST's `SENDER_BASE_KEY` derivation, for benchmarks drawing senders from a pool. |
@@ -2095,7 +2215,7 @@ The two forms are mutually exclusive per contract. `address` is required with `t
 
 `eest_payloads` generates **stateful** EEST benchmark fixtures: it boots a filler EL client on a *writable copy* of a pre-populated snapshot datadir, runs `fill-stateful` against the live client (recording engine-API payloads anchored to the snapshot's head block), and writes the fixtures to each target's `output_dir`. `fill-stateful` itself does not manage datadirs — benchmarkoor boots the filler and snapshots it.
 
-> **Filler client:** `geth` (`ethpandaops/geth:master`) is the production-ready filler. `nethermind` (`nethermindeth/nethermind:master`) also works — it implements `testing_buildBlockV1` with correct EIP-7928 block-access-lists, and `fill-stateful`'s per-test rewind falls back to `debug_resetHead` for it (nethermind has no `debug_setHead`). `besu` works too with an image carrying the merged `TestingBuildBlockV1` coinbase fix (e.g. `ethpandaops/besu:bal-devnet-7`); benchmarkoor auto-pins its session priority fee.
+> **Filler client:** `geth` (e.g. `ethpandaops/geth:glamsterdam-devnet-8`) is the production-ready filler. `nethermind` (e.g. `ethpandaops/nethermind:glamsterdam-devnet-8`) also works — it implements `testing_buildBlockV1` with correct EIP-7928 block-access-lists, and `fill-stateful`'s per-test rewind falls back to `debug_resetHead` for it (nethermind has no `debug_setHead`). `besu` can fill with an image that carries the merged `TestingBuildBlockV1` coinbase fix; benchmarkoor auto-pins its session priority fee. The devnet-8 examples in `examples/configuration/` fill with geth and nethermind.
 >
 > **Fill image:** by default benchmarkoor builds the fill image (the `uv`/python toolchain that runs `fill-stateful`) from a Dockerfile **embedded in the binary** — nothing to publish or pass. To pull a pre-built image instead, set `fill_image`; to build from a custom Dockerfile, set `fill_dockerfile`. The embedded Dockerfile lives at `pkg/builder/Dockerfile.eest-filler`; to build it by hand:
 > ```bash
@@ -2157,7 +2277,7 @@ Every field below is also available per-target; a non-nil/non-empty value on a t
 |---|---|---|---|
 | `filler_image` | string | – | Docker image for the filler client (e.g. `ethpandaops/geth:master`). |
 | `fork` | string | – | Fork to fill against, e.g. `Osaka` (passed to `fill-stateful --fork`). |
-| `tests` | string[] | – | pytest paths inside the fill image, e.g. `tests/benchmark/compute`. Required after resolution — set here or per-target. |
+| `tests` | string[] | – | pytest paths inside the fill image, e.g. `tests/benchmark/compute`. Required after resolution — set here or per-target (a `pre_runs` target with `fill: false` needs none). |
 | `filter` | string | – | pytest `-k` expression (substring/node-id selection). |
 | `marker` | string | – | pytest `-m` marker expression, orthogonal to `filter`'s `-k`, e.g. `repricing` / `not repricing`. |
 | `address_stubs` | map | – | Inline `--address-stubs` map: stub name → arbitrary string fields (e.g. `addr`, `pkey`). Materialised to a temp JSON file at build time. Mutually exclusive with `address_stubs_file`. |

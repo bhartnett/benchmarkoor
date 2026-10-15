@@ -43,6 +43,16 @@ runner:
   # Can also be set via BENCHMARKOOR_RUNNER_GITHUB_TOKEN environment variable.
   # github_token: ${GITHUB_TOKEN:-}
 
+  # Optional: Measure the IOPS, bandwidth and QD1 latency of the datadir
+  # block device before the first client starts (Linux only). The probe
+  # writes a test file into the data mount with direct I/O and deletes it
+  # after. The deep workloads follow the EIP-7870 fio commands.
+  # storage_probe:
+  #   enabled: true
+  #   file_size: 4GB
+  #   duration: 5s
+  #   io_depth: 64
+
   # Optional: Stream periodic run-status reports to a benchmarkoor API
   # instance so the UI can show in-progress runs. The API must have a
   # matching `api.ingest.token` configured.
@@ -309,7 +319,8 @@ runner:
 #     config:                          # shared defaults; targets override when set
 #       fork: amsterdam                # the TARGET fork being filled
 #       datadir_method: schelk         # schelk advances source_dir IN PLACE (no copy)
-#       gas_limit: 1000000000000       # gas-bump target (default 1 TGas)
+#       gas_limit: 1000000000000       # gas-bump target (default 1 TGas); below the head ramps down (Amsterdam)
+#       # fill: false                  # skip fill-stateful: a gas-ramp-only pre-run, no tests needed
 #       rpc_seed_key: "0x0000000000000000000000000000000000000000000000000000000000000001"
 #       # eoa_start: 1000000000        # first key of fill-stateful's EOA iterator (--eoa-start);
 #                                      # kept clear of the eest_payloads fill on the same datadir
@@ -358,6 +369,12 @@ runner:
 #       #   source_dir: /data/snapshots/reth
 #       #   output_dir: /data/pre-runs/reth
 #       #   replay_from: pre-run-geth
+#       # Continue a recorded chain (e.g. a release's pre-run), then ramp the gas
+#       # limit down; the new bundle holds only the ramp, replayed after the base.
+#       # - name: ramp-geth
+#       #   base_bundle: /data/release/pre-runs/geth/pre_run_bundle
+#       #   fill: false
+#       #   gas_limit: 200000000
 #
 #   # ---------------------------------------------------------------------------
 #   # Boots a filler client on a copy of a snapshot datadir (e.g. a state_actor
@@ -632,24 +649,21 @@ runner:
       #   memory: "16g"
       #   # Disable swap for the container (sets memory-swap equal to memory and swappiness to 0)
       #   swap_disabled: true
-      #   # Block I/O throttling (optional)
-      #   blkio_config:
-      #     # Limit device read bandwidth (supports units: b, k, m, g)
-      #     device_read_bps:
-      #       - path: /dev/sdb
-      #         rate: '12mb'
-      #     # Limit device read IOPS (integer)
-      #     device_read_iops:
-      #       - path: /dev/sdb
-      #         rate: '120'
-      #     # Limit device write bandwidth
-      #     device_write_bps:
-      #       - path: /dev/sdb
-      #         rate: '1024k'
-      #     # Limit device write IOPS
-      #     device_write_iops:
-      #       - path: /dev/sdb
-      #         rate: '30'
+      #   # Disk I/O limits on the block device that holds the client datadir
+      #   # (Linux only). benchmarkoor finds the device, so no path is needed.
+      #   # These values match the storage recommendations of EIP-7870.
+      #   device_read_iops: 50000
+      #   device_write_iops: 15000
+      #   # Bandwidth limits (supports units: b, k, m, g; "mb" is a mebibyte)
+      #   device_read_bps: "500mb"
+      #   device_write_bps: "500mb"
+      #   # Optional: the device to throttle, when the automatic lookup cannot
+      #   # find it (e.g. benchmarkoor runs in a container).
+      #   # device_path: /dev/nvme0n1
+      #   # Optional: "io.cost" gives reads and writes one shared budget of
+      #   # device time, as on a real disk. It throttles all I/O on the whole
+      #   # disk and needs root. Default: "io.max" (separate caps).
+      #   # device_throttle: io.cost
       #   # CPU frequency management (Linux only, requires root and cpufreq subsystem)
       #   # These settings are applied to the CPUs specified by cpuset/cpuset_count,
       #   # or all online CPUs if neither is specified.

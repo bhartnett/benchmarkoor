@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ethpandaops/benchmarkoor/pkg/api/gormlogger"
+	"github.com/ethpandaops/benchmarkoor/pkg/api/sqlitedsn"
 	"github.com/ethpandaops/benchmarkoor/pkg/config"
 	"github.com/glebarez/sqlite"
 	"github.com/sirupsen/logrus"
@@ -63,8 +64,49 @@ type Store interface {
 	// Run deletion queue. See deletion.go.
 	MarkRunForDeletion(ctx context.Context, runID string) error
 	UnmarkRunForDeletion(ctx context.Context, runID string) error
+	MarkRunsForDeletionBySuite(
+		ctx context.Context, suiteHash string,
+	) (*SuiteDeletionResult, error)
 	ListRunsPendingDeletion(ctx context.Context) ([]Run, error)
 	SetRunDeletionError(ctx context.Context, runID, msg string) error
+
+	// DatabaseStats reports the size and contents of the index database.
+	// It uses only cheap queries, so it is safe to call per request: the
+	// per-test tables get estimated row counts. See dbstats.go.
+	DatabaseStats(ctx context.Context) (*DatabaseStats, error)
+
+	// Index failures: runs storage exposes that the indexer cannot index,
+	// plus their own deletion queue. See index_failure.go.
+	RecordIndexFailure(
+		ctx context.Context, discoveryPath, runID, msg string,
+	) error
+	ClearIndexFailure(
+		ctx context.Context, discoveryPath, runID string,
+	) error
+	ListIndexFailuresByPath(
+		ctx context.Context, discoveryPath string,
+	) ([]IndexFailure, error)
+	ListIndexFailures(
+		ctx context.Context, limit, offset int,
+	) ([]IndexFailure, error)
+	CountIndexFailures(ctx context.Context) (int64, error)
+	MarkIndexFailureForDeletion(ctx context.Context, runID string) error
+	UnmarkIndexFailureForDeletion(ctx context.Context, runID string) error
+	MarkAllIndexFailuresForDeletion(ctx context.Context) (int64, error)
+	UnmarkAllIndexFailuresForDeletion(ctx context.Context) (int64, error)
+	ListIndexFailuresPendingDeletion(
+		ctx context.Context,
+	) ([]IndexFailure, error)
+	SetIndexFailureDeletionError(
+		ctx context.Context, discoveryPath, runID, msg string,
+	) error
+
+	// Indexer passes: one row per finished indexing pass, so the admin page
+	// can show how long they take and what they do. See indexer_pass.go.
+	RecordIndexerPass(ctx context.Context, pass *IndexerPass) error
+	ListIndexerPasses(
+		ctx context.Context, limit int,
+	) ([]IndexerPass, error)
 
 	UpsertSuite(ctx context.Context, suite *Suite) error
 
@@ -100,6 +142,40 @@ type store struct {
 	// runsGen is bumped on every runs-table mutation so readers can cheaply
 	// detect staleness. See RunsGeneration.
 	runsGen atomic.Uint64
+}
+
+// migratedModels is every model the index database owns, in the order they
+// are migrated. DatabaseStats walks the same list, so a new table shows up in
+// the admin report without anyone remembering to add it there.
+var migratedModels = []struct{ value any }{
+	{value: &Run{}},
+	{value: &TestStat{}},
+	{value: &TestStatsBlockLog{}},
+	{value: &Suite{}},
+	{value: &LiveRun{}},
+	{value: &IndexFailure{}},
+	{value: &IndexerPass{}},
+}
+
+// migratedValues returns the models as AutoMigrate wants them.
+func migratedValues() []any {
+	values := make([]any, 0, len(migratedModels))
+	for _, model := range migratedModels {
+		values = append(values, model.value)
+	}
+
+	return values
+}
+
+// tableName resolves a model to its table name through GORM's naming
+// strategy, so the report never hardcodes a name the schema could change.
+func (s *store) tableName(model any) (string, error) {
+	stmt := &gorm.Statement{DB: s.readDB}
+	if err := stmt.Parse(model); err != nil {
+		return "", fmt.Errorf("resolving table name: %w", err)
+	}
+
+	return stmt.Table, nil
 }
 
 // NewStore creates a new index Store backed by the configured database driver.
@@ -147,11 +223,7 @@ func (s *store) Start(ctx context.Context) error {
 	}
 
 	if err := s.db.WithContext(ctx).AutoMigrate(
-		&Run{},
-		&TestStat{},
-		&TestStatsBlockLog{},
-		&Suite{},
-		&LiveRun{},
+		migratedValues()...,
 	); err != nil {
 		return fmt.Errorf("running index migrations: %w", err)
 	}
@@ -175,7 +247,9 @@ func (s *store) Start(ctx context.Context) error {
 // via WAL mode. For in-memory databases both point to the same
 // instance since separate connections would create independent DBs.
 func (s *store) openSQLite(gormCfg *gorm.Config) error {
-	writeDB, err := gorm.Open(sqlite.Open(s.cfg.SQLite.Path), gormCfg)
+	dsn := sqlitedsn.Build(s.cfg.SQLite.Path, sqlitePragmas)
+
+	writeDB, err := gorm.Open(sqlite.Open(dsn), gormCfg)
 	if err != nil {
 		return fmt.Errorf("opening index database (write): %w", err)
 	}
@@ -187,10 +261,6 @@ func (s *store) openSQLite(gormCfg *gorm.Config) error {
 
 	// Single writer prevents "database is locked" contention.
 	writeSQLDB.SetMaxOpenConns(1)
-
-	if err := applySQLitePragmas(writeDB); err != nil {
-		return err
-	}
 
 	s.db = writeDB
 
@@ -205,9 +275,7 @@ func (s *store) openSQLite(gormCfg *gorm.Config) error {
 
 	// File-backed SQLite: open a separate read pool so concurrent
 	// readers are not blocked behind the single-writer connection.
-	readDB, err := gorm.Open(
-		sqlite.Open(s.cfg.SQLite.Path), gormCfg,
-	)
+	readDB, err := gorm.Open(sqlite.Open(dsn), gormCfg)
 	if err != nil {
 		return fmt.Errorf("opening index database (read): %w", err)
 	}
@@ -218,10 +286,6 @@ func (s *store) openSQLite(gormCfg *gorm.Config) error {
 	}
 
 	readSQLDB.SetMaxOpenConns(4)
-
-	if err := applySQLitePragmas(readDB); err != nil {
-		return err
-	}
 
 	s.readDB = readDB
 
@@ -669,8 +733,8 @@ func (s *store) ListTestStatsBySuite(
 	return stats, nil
 }
 
-// clientRunRow holds the lightweight result of the distinct client/run_id
-// query used by ListTestStatsBySuiteRecent.
+// clientRunRow holds the lightweight result of the client/run_id query used
+// by ListTestStatsBySuiteRecent.
 type clientRunRow struct {
 	Client   string
 	RunID    string
@@ -683,16 +747,28 @@ type clientRunRow struct {
 func (s *store) ListTestStatsBySuiteRecent(
 	ctx context.Context, suiteHash string, maxRunsPerClient int,
 ) ([]TestStat, error) {
-	// Step 1: lightweight query to get one row per client/run combo. We group by
-	// client and run_id (rather than SELECT DISTINCT over run_start too) so that
-	// a run whose stats carry inconsistent run_start values still counts as a
-	// single run. Otherwise it would produce several rows, consume several of the
-	// per-client slots, and evict other recent runs.
+	// Step 1: list the suite's runs, newest first, from the runs table.
+	//
+	// The indexer writes a run's test_stats with the client and run_start of
+	// its runs row, so the runs table answers "which runs, which client, and
+	// when" on its own. It holds one row per run, not one per test. Grouping
+	// test_stats instead sorted every row of the suite, which is 35M rows for
+	// the largest suite in production and several GB of sorter memory.
+	//
+	// The EXISTS keeps out runs with no test stats, for example a run whose
+	// result.json has no step data. It is one seek on idx_td_suite_test_run
+	// per run, whose (suite_hash, run_id) prefix matches it.
+	//
+	// We group by client and run_id so that a run indexed under two discovery
+	// paths still takes a single per-client slot.
 	var rows []clientRunRow
 	if err := s.readDB.WithContext(ctx).
-		Model(&TestStat{}).
-		Select("client, run_id, MAX(run_start) AS run_start").
+		Model(&Run{}).
+		Select("client, run_id, MAX(timestamp) AS run_start").
 		Where("suite_hash = ?", suiteHash).
+		Where("EXISTS (SELECT 1 FROM test_stats ts " +
+			"WHERE ts.suite_hash = runs.suite_hash " +
+			"AND ts.run_id = runs.run_id)").
 		Group("client, run_id").
 		// run_id is a deterministic tie-breaker so that, when more runs than the
 		// per-client cap share the same run_start, the same runs are kept on
@@ -1122,26 +1198,24 @@ func (s *store) withRetry(fn func() error) error {
 	return err
 }
 
-// applySQLitePragmas sets performance and reliability pragmas on a
-// SQLite GORM connection.
-func applySQLitePragmas(db *gorm.DB) error {
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA busy_timeout=5000",
-		"PRAGMA foreign_keys=ON",
-		"PRAGMA temp_store=MEMORY",
-		"PRAGMA cache_size=-64000",
-		"PRAGMA mmap_size=268435456",
-	}
-
-	for _, p := range pragmas {
-		if err := db.Exec(p).Error; err != nil {
-			return fmt.Errorf("setting pragma %q: %w", p, err)
-		}
-	}
-
-	return nil
+// sqlitePragmas are the pragmas every index-database connection needs. They
+// ride in the DSN rather than a one-off Exec because SQLite applies them per
+// connection: an Exec reaches the one pooled connection that served it, and
+// the read pool opens four. A connection that missed temp_store=MEMORY spills
+// the scratch b-tree of a GROUP BY or an ORDER BY to a temp file, which fails
+// with "disk I/O error" on a container whose root filesystem is read-only.
+// One that missed cache_size reads a large database through a 2MB page cache.
+//
+// cache_size and mmap_size are per connection, so the pool can hold five
+// copies of each. Change them with that multiplier in mind.
+var sqlitePragmas = []sqlitedsn.Pragma{
+	{Name: "journal_mode", Value: "WAL"},
+	{Name: "synchronous", Value: "NORMAL"},
+	{Name: "busy_timeout", Value: "5000"},
+	{Name: "foreign_keys", Value: "ON"},
+	{Name: "temp_store", Value: "MEMORY"},
+	{Name: "cache_size", Value: "-64000"},
+	{Name: "mmap_size", Value: "268435456"},
 }
 
 // isSQLiteTransient returns true for transient SQLite errors that may

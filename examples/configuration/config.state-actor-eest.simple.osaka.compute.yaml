@@ -24,7 +24,6 @@ builder:
       nethermind: ghcr.io/ethereum/state-actor-nethermind:main
       ethrex: ghcr.io/ethereum/state-actor-ethrex:main
       erigon: ghcr.io/ethereum/state-actor-erigon:main
-      nimbus: ghcr.io/ethereum/state-actor-nimbus:main
     pull_policy: always
     config:
       seed: 1234
@@ -54,8 +53,6 @@ builder:
         output_dir: ${STATE_DIR}/ethrex
       - client: erigon
         output_dir: ${STATE_DIR}/erigon
-      - client: nimbus
-        output_dir: ${STATE_DIR}/nimbus
 
   ## Stage 2: Building EEST stateful fixtures
   eest_payloads:
@@ -142,7 +139,6 @@ runner:
         # erigon image.
         erigon: ${STATE_DIR}/erigon/chainspec.json
         #erigon: ${STATE_DIR}/geth/geth-genesis.json
-        nimbus: ${STATE_DIR}/nimbus/nimbus-genesis.json
 
     datadirs:
       geth:
@@ -162,9 +158,6 @@ runner:
         method: copy
       erigon:
         source_dir: ${STATE_DIR}/erigon
-        method: copy
-      nimbus:
-        source_dir: ${STATE_DIR}/nimbus
         method: copy
 
   instances:
@@ -207,24 +200,8 @@ runner:
         - --skip-genesis-validation
     - id: erigon
       client: erigon
-      # MUST match the erigon that state-actor pins for the snapshot
-      # (Dockerfile.erigon builds erigon at the bal-devnet-7 commit and notes the
-      # daemon must use that exact binary). state-actor's `erigon init` encodes the
-      # MDBX chain config the bal-devnet-7 way (e.g. chainId as a JSON string);
-      # stable erigon (erigontech/erigon:latest, 3.4.x) panics reading it back with
-      # "cannot unmarshal \"1337\" into a *big.Int". ethpandaops/erigon:bal-devnet-7
-      # reads it correctly and supports the amsterdam/BAL (EIP-7928) fork these
-      # benchmarks target.
-      image: ethpandaops/erigon:bal-devnet-7
-    - id: nimbus
-      client: nimbus
-      # state-actor writes nimbus's current Aristo on-disk format, which only
-      # nimbus-eth1 master builds from commit 2f0ae87 onwards read (no tagged
-      # release does yet), so track master.
-      image: statusim/nimbus-eth1:master
-      extra_args:
-        # --debug-rewrite-datadir-id: nimbus rebuilds genesis from --network's alloc
-        # and refuses a datadir whose block-0 hash differs. The emitted
-        # nimbus-genesis.json has an empty alloc (the state lives in the snapshot),
-        # so skip that check (the analogue of ethrex's --skip-genesis-validation).
-        - --debug-rewrite-datadir-id
+      # Must read the MDBX chain config that state-actor's `erigon init` writes
+      # (e.g. chainId as a JSON string). Stable erigon (erigontech/erigon:latest,
+      # 3.4.x) panics on it with "cannot unmarshal \"1337\" into a *big.Int";
+      # ethpandaops/erigon:main reads it (as in benchmarkoor-tests state-actor/v2).
+      image: ethpandaops/erigon:main

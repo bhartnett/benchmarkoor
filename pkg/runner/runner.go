@@ -21,6 +21,7 @@ import (
 	"github.com/ethpandaops/benchmarkoor/pkg/docker"
 	"github.com/ethpandaops/benchmarkoor/pkg/executor"
 	"github.com/ethpandaops/benchmarkoor/pkg/fsutil"
+	"github.com/ethpandaops/benchmarkoor/pkg/iocost"
 	"github.com/ethpandaops/benchmarkoor/pkg/livereport"
 	"github.com/ethpandaops/benchmarkoor/pkg/upload"
 	"github.com/ethpandaops/benchmarkoor/pkg/version"
@@ -142,33 +143,36 @@ type SystemInfo struct {
 	// CPUTopology maps each logical CPU to its core, socket, and NUMA node.
 	// It is only set on Linux hosts that expose the sysfs topology tree.
 	CPUTopology []cputopology.CPU `json:"cpu_topology,omitempty"`
+	// Storage is the block device that holds the client datadir. It is only
+	// set on Linux hosts.
+	Storage *StorageInfo `json:"storage,omitempty"`
 }
 
 // ResolvedResourceLimits contains the resolved resource limits for config.json output.
 type ResolvedResourceLimits struct {
-	CpusetCpus     string               `json:"cpuset_cpus,omitempty"`
-	CpusetTopology string               `json:"cpuset_topology,omitempty"`
-	Memory         string               `json:"memory,omitempty"`
-	MemoryBytes    int64                `json:"memory_bytes,omitempty"`
-	SwapDisabled   bool                 `json:"swap_disabled,omitempty"`
-	BlkioConfig    *ResolvedBlkioConfig `json:"blkio_config,omitempty"`
-	CPUFreqKHz     *uint64              `json:"cpu_freq_khz,omitempty"`
-	CPUTurboBoost  *bool                `json:"cpu_turboboost,omitempty"`
-	CPUGovernor    string               `json:"cpu_freq_governor,omitempty"`
-}
+	CpusetCpus     string  `json:"cpuset_cpus,omitempty"`
+	CpusetTopology string  `json:"cpuset_topology,omitempty"`
+	Memory         string  `json:"memory,omitempty"`
+	MemoryBytes    int64   `json:"memory_bytes,omitempty"`
+	SwapDisabled   bool    `json:"swap_disabled,omitempty"`
+	CPUFreqKHz     *uint64 `json:"cpu_freq_khz,omitempty"`
+	CPUTurboBoost  *bool   `json:"cpu_turboboost,omitempty"`
+	CPUGovernor    string  `json:"cpu_freq_governor,omitempty"`
+	// DevicePath is the datadir block device that the device_* limits throttle.
+	// With io.cost, it is the whole disk under the datadir device.
+	DevicePath      string `json:"device_path,omitempty"`
+	DeviceReadBps   uint64 `json:"device_read_bps,omitempty"`
+	DeviceReadIOps  uint64 `json:"device_read_iops,omitempty"`
+	DeviceWriteBps  uint64 `json:"device_write_bps,omitempty"`
+	DeviceWriteIOps uint64 `json:"device_write_iops,omitempty"`
+	// DeviceThrottle is "io.cost" when the limits use the io.cost controller.
+	// It is empty for io.max, the default.
+	DeviceThrottle string `json:"device_throttle,omitempty"`
+	// DeviceCostModel is the io.cost.model line that the run wrote.
+	DeviceCostModel string `json:"device_cost_model,omitempty"`
 
-// ResolvedBlkioConfig contains the resolved blkio configuration for config.json output.
-type ResolvedBlkioConfig struct {
-	DeviceReadBps   []ResolvedThrottleDevice `json:"device_read_bps,omitempty"`
-	DeviceReadIOps  []ResolvedThrottleDevice `json:"device_read_iops,omitempty"`
-	DeviceWriteBps  []ResolvedThrottleDevice `json:"device_write_bps,omitempty"`
-	DeviceWriteIOps []ResolvedThrottleDevice `json:"device_write_iops,omitempty"`
-}
-
-// ResolvedThrottleDevice contains a resolved throttle device for config.json output.
-type ResolvedThrottleDevice struct {
-	Path string `json:"path"`
-	Rate uint64 `json:"rate"`
+	// deviceMajMin is the device number for the io.cost files.
+	deviceMajMin string
 }
 
 // ResolvedInstance contains the resolved configuration for a client instance.
@@ -211,6 +215,7 @@ func NewRunner(
 	registry client.Registry,
 	exec executor.Executor,
 	cpufreqMgr cpufreq.Manager,
+	iocostMgr iocost.Manager,
 	uploader upload.Uploader,
 	preRunLogBuffer *BufferHook,
 ) Runner {
@@ -226,8 +231,10 @@ func NewRunner(
 		registry:        registry,
 		executor:        exec,
 		cpufreqMgr:      cpufreqMgr,
+		iocostMgr:       iocostMgr,
 		uploader:        uploader,
 		preRunLogBuffer: preRunLogBuffer,
+		storageProbes:   make(map[string]storageProbe, 1),
 		done:            make(chan struct{}),
 	}
 }
@@ -240,8 +247,11 @@ type runner struct {
 	registry        client.Registry
 	executor        executor.Executor
 	cpufreqMgr      cpufreq.Manager
+	iocostMgr       iocost.Manager
 	uploader        upload.Uploader
 	preRunLogBuffer *BufferHook // Buffered logs from before RunInstance (may be nil).
+	storageProbesMu sync.Mutex
+	storageProbes   map[string]storageProbe // Disk probe outcomes, per filesystem.
 	done            chan struct{}
 	wg              sync.WaitGroup
 }
@@ -516,9 +526,10 @@ func (r *runner) liveSnapshotter(
 				report.Tests = make(map[string]indexstore.LiveTestStats, len(live))
 				for name, t := range live {
 					report.Tests[name] = indexstore.LiveTestStats{
-						Passed:            t.Passed,
-						GasUsed:           t.GasUsed,
-						GasUsedDurationNs: t.GasUsedDurationNs,
+						Passed:             t.Passed,
+						GasUsed:            t.GasUsed,
+						GasUsedDurationNs:  t.GasUsedDurationNs,
+						RejectedDurationNs: t.RejectedDurationNs,
 					}
 				}
 			}

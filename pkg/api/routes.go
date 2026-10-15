@@ -174,9 +174,27 @@ func (s *server) buildRouter() http.Handler {
 				r.Get("/runs/deletion-queue", s.handleDeletionQueue)
 			}
 
-			// Indexer management.
+			// Indexer management, and the recent pass history behind the
+			// duration chart on the admin page.
 			if s.indexer != nil {
 				r.Post("/indexer/run", s.handleRunIndexer)
+				r.Get("/indexer/stats", s.handleIndexerStats)
+			}
+
+			// Index database size and contents, so an admin can see
+			// whether a cleanup is due.
+			if s.indexStore != nil {
+				r.Get("/database", s.handleDatabaseStats)
+			}
+
+			// Runs storage exposes that the indexer cannot index, and
+			// housekeeping for them. Recording them needs the index store.
+			if s.indexStore != nil {
+				r.Get("/indexer/failures", s.handleIndexerFailures)
+				r.Post("/indexer/failures/delete",
+					s.handleDeleteIndexerFailures)
+				r.Post("/indexer/failures/delete/cancel",
+					s.handleCancelDeleteIndexerFailures)
 			}
 		})
 	})
