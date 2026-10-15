@@ -50,8 +50,7 @@ builder:
       nethermind: ghcr.io/ethereum/state-actor-nethermind:main-f171c26
       ethrex: ghcr.io/ethereum/state-actor-ethrex:main-f171c26
       erigon: ghcr.io/ethereum/state-actor-erigon:main-f171c26
-      # Built from ethereum/state-actor#142; use :main once it merges.
-      nimbus: ghcr.io/ethereum/state-actor-nimbus:pr-142-2d034a7
+      nimbus: ghcr.io/ethereum/state-actor-nimbus:main-6dd2e8f
     pull_policy: always
     config:
       seed: 1234

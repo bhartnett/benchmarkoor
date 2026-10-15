@@ -22,9 +22,8 @@
 # --override.amsterdam flag, besu/reth/ethrex/nimbus via genesis_fork_override,
 # nethermind via genesis_eip_override.
 #
-# nimbus is commented out below: its state-actor image is a build of
-# ethereum/state-actor#142 that has only been tested on small snapshots (see the
-# simple configs). Enable it to try it at this size.
+# nimbus is commented out below: its state-actor build has only been tested on
+# small snapshots (see the simple configs). Enable it to try it at this size.
 #
 global:
   log_level: info
@@ -51,8 +50,7 @@ builder:
       reth: ghcr.io/ethereum/state-actor-reth:main-f171c26
       besu: ghcr.io/ethereum/state-actor-besu:main-f171c26
       erigon: ghcr.io/ethereum/state-actor-erigon:main-f171c26
-      # Built from ethereum/state-actor#142; use :main once it merges.
-      # nimbus: ghcr.io/ethereum/state-actor-nimbus:pr-142-2d034a7
+      # nimbus: ghcr.io/ethereum/state-actor-nimbus:main-6dd2e8f
     pull_policy: always
     config:
       seed: 42
