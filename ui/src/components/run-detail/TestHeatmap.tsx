@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useQueries } from '@tanstack/react-query'
 import clsx from 'clsx'
 import { Check, Copy, Download } from 'lucide-react'
@@ -6,6 +6,8 @@ import type { TestEntry, SuiteTest, AggregatedStats, MethodsAggregated, StepResu
 import { fetchHead } from '@/api/client'
 import { ColorScaleLegend } from '@/components/shared/ColorScaleLegend'
 import { Modal } from '@/components/shared/Modal'
+import { TestNavControls } from '@/components/shared/TestNavControls'
+import { useTestNavigation } from '@/hooks/useTestNavigation'
 import { TestName } from '@/components/shared/TestName'
 import { compileQuery, testNameMatches, toggleSearchTerm } from '@/utils/eestNameFilter'
 import { TimeBreakdown } from './TimeBreakdown'
@@ -21,6 +23,8 @@ import { useBlockLogs } from '@/api/hooks/useBlockLogs'
 import {
   DEFAULT_SLOW_MS,
   DEFAULT_THRESHOLD,
+  REJECTED_OVERLAY_IMAGE,
+  REJECTED_TILE_STYLE,
   SLOW_COLOR,
   THRESHOLD_COLORS,
   THRESHOLD_LIMIT_STEP,
@@ -32,6 +36,8 @@ import {
   thresholdStepRange,
 } from '@/utils/perfThreshold'
 import { getPayloadTimes } from '@/utils/payloadTime'
+import { type HeatmapGroupMode, benchmarkGasGroup, gasUsedGroup, groupByGas } from '@/utils/gasGroup'
+import { fixtureGasByTest } from '@/components/compare/compareMetrics'
 
 // Aggregate stats from selected steps of a test entry
 function getAggregatedStats(entry: TestEntry, stepFilter: StepTypeOption[] = ALL_STEP_TYPES): AggregatedStats | undefined {
@@ -54,6 +60,8 @@ function getAggregatedStats(entry: TestEntry, stepFilter: StepTypeOption[] = ALL
   let timeTotal = 0
   let gasUsedTotal = 0
   let gasUsedTimeTotal = 0
+  let rejected = 0
+  let rejectedTimeTotal = 0
   let success = 0
   let fail = 0
 
@@ -66,6 +74,8 @@ function getAggregatedStats(entry: TestEntry, stepFilter: StepTypeOption[] = ALL
       timeTotal += step.aggregated.time_total
       gasUsedTotal += step.aggregated.gas_used_total
       gasUsedTimeTotal += step.aggregated.gas_used_time_total
+      rejected += step.aggregated.rejected ?? 0
+      rejectedTimeTotal += step.aggregated.rejected_time_total ?? 0
       success += step.aggregated.success
       fail += step.aggregated.fail
 
@@ -95,6 +105,8 @@ function getAggregatedStats(entry: TestEntry, stepFilter: StepTypeOption[] = ALL
     time_total: timeTotal,
     gas_used_total: gasUsedTotal,
     gas_used_time_total: gasUsedTimeTotal,
+    rejected,
+    rejected_time_total: rejectedTimeTotal,
     success,
     fail,
     msg_count: 0,
@@ -103,7 +115,8 @@ function getAggregatedStats(entry: TestEntry, stepFilter: StepTypeOption[] = ALL
 }
 
 export type SortMode = 'order' | 'mgas' | 'gas' | 'duration'
-export type GroupMode = 'none' | 'gas'
+/** See HeatmapGroupMode: no blocks, blocks per benchmark gas, or per gas used. */
+export type GroupMode = HeatmapGroupMode
 // ColorMode selects the metric behind the tile colours and the
 // distribution histogram: throughput or payload duration.
 export type ColorMode = 'mgas' | 'duration'
@@ -113,16 +126,6 @@ const SORT_CAPTIONS: Record<SortMode, string> = {
   mgas: '(by MGas/s, slowest first)',
   gas: '(by gas used, most first)',
   duration: '(by slowest payload, longest first)',
-}
-
-const GAS_GROUP_STEP = 30_000_000 // 30M gas per group
-
-function getGasGroup(gasUsed: number): number {
-  return Math.round(gasUsed / GAS_GROUP_STEP) * GAS_GROUP_STEP
-}
-
-function formatGasGroup(gasGroup: number): string {
-  return `${Math.round(gasGroup / 1_000_000)}M`
 }
 
 interface TestHeatmapProps {
@@ -205,6 +208,10 @@ interface TestData {
   isSlow: boolean
   hasFail: boolean
   noData: boolean
+  // rejectedNs is the time the client took to reject the test's
+  // expected-invalid payloads, or undefined when it has none. Such a test
+  // has no MGas/s (noData), but it does have a payload time.
+  rejectedNs?: number
   // notProcessed is true when the test is part of the suite but no
   // result entry exists for it yet (live run still in progress, run
   // canceled, etc). Distinct from noData (test ran but produced no gas
@@ -288,6 +295,18 @@ function PostTestDumps({ runId, testName, calls }: { runId: string; testName: st
   )
 }
 
+/** Whether a tile passes the status and search filters (the rest dim). */
+function tileMatchesFilter(test: TestData, statusFilter: TestStatusFilter, searchQuery?: string): boolean {
+  const matchesStatusFilter =
+    statusFilter === 'all' ||
+    // Not-processed tiles are neither "passed" nor "failed" — exclude
+    // them from those filters so the user can isolate ran-and-passed /
+    // ran-and-failed tests cleanly.
+    (!test.notProcessed && statusFilter === 'passed' && !test.hasFail) ||
+    (!test.notProcessed && statusFilter === 'failed' && test.hasFail)
+  return matchesStatusFilter && (!searchQuery || testNameMatches(test.testKey, searchQuery))
+}
+
 function HeatmapCell({
   test,
   threshold,
@@ -321,18 +340,15 @@ function HeatmapCell({
   onMouseEnter: (test: TestData, event: React.MouseEvent) => void
   onMouseLeave: () => void
 }) {
-  const matchesStatusFilter =
-    statusFilter === 'all' ||
-    // Not-processed tiles are neither "passed" nor "failed" — exclude
-    // them from those filters so the user can isolate ran-and-passed /
-    // ran-and-failed tests cleanly.
-    (!test.notProcessed && statusFilter === 'passed' && !test.hasFail) ||
-    (!test.notProcessed && statusFilter === 'failed' && test.hasFail)
-  const matchesSearchQuery = !searchQuery || testNameMatches(test.testKey, searchQuery)
-  const matchesFilter = matchesStatusFilter && matchesSearchQuery
+  const matchesFilter = tileMatchesFilter(test, statusFilter, searchQuery)
   let baseStyle: React.CSSProperties
   if (test.notProcessed) {
     baseStyle = NOT_PROCESSED_STYLE
+  } else if (test.rejectedNs !== undefined) {
+    // The time to reject is a real payload time, so duration mode colours it.
+    baseStyle = colorMode === 'duration'
+      ? { backgroundColor: getColorByDuration(test.rejectedNs, slowMs), backgroundImage: REJECTED_OVERLAY_IMAGE }
+      : REJECTED_TILE_STYLE
   } else if (test.noData) {
     baseStyle = NO_DATA_STYLE
   } else if (colorMode === 'duration') {
@@ -549,14 +565,20 @@ export function TestHeatmap({
       // Per-payload durations, so a test with several blocks is marked
       // slow only when a single block is above the limit.
       const payloads = getPayloadTimes(entry, stepFilter)
+      // A rejected test has no MGas/s, but its time to reject is a payload
+      // time: it can be slow, and it counts in the duration range.
+      const rejectedNs = noData && statsFiltered?.rejected ? statsFiltered.rejected_time_total ?? 0 : undefined
+      const payloadNs = noData ? rejectedNs : payloads.maxNs
 
-      const isSlow = !noData && isSlowPayload(payloads.maxNs, slowMs)
+      const isSlow = payloadNs !== undefined && isSlowPayload(payloadNs, slowMs)
 
       if (!noData) {
         minMgas = Math.min(minMgas, mgasPerSec)
         maxMgas = Math.max(maxMgas, mgasPerSec)
-        minPayloadNs = Math.min(minPayloadNs, payloads.maxNs)
-        maxPayloadNs = Math.max(maxPayloadNs, payloads.maxNs)
+      }
+      if (payloadNs !== undefined) {
+        minPayloadNs = Math.min(minPayloadNs, payloadNs)
+        maxPayloadNs = Math.max(maxPayloadNs, payloadNs)
         if (isSlow) slowTestCount++
       }
 
@@ -567,11 +589,12 @@ export function TestHeatmap({
         mgasPerSec: mgasPerSec ?? 0,
         gasUsedTotal: statsFiltered?.gas_used_total ?? 0,
         gasUsedTimeTotal: statsFiltered?.gas_used_time_total ?? 0,
-        maxPayloadNs: payloads.maxNs,
+        maxPayloadNs: payloadNs ?? 0,
         payloadCount: payloads.count,
         isSlow,
         hasFail: statsAll ? statsAll.fail > 0 : false,
         noData,
+        rejectedNs,
         notProcessed: false,
       })
     }
@@ -650,29 +673,31 @@ export function TestHeatmap({
     return sorted
   }, [testData, sortMode])
 
+  // Blocks by gas, most gas first; each keeps the sort order. A rejected
+  // test reports no gas used: its fixture records the gas instead.
   const groupedData = useMemo(() => {
     if (groupMode === 'none') return null
+    const fixtureGas = fixtureGasByTest(suiteTests)
+    const groupOf = groupMode === 'benchmark'
+      ? (t: TestData) => benchmarkGasGroup(t.testKey)
+      : (t: TestData) => gasUsedGroup(t.gasUsedTotal > 0 ? t.gasUsedTotal : t.rejectedNs !== undefined ? fixtureGas.get(t.testKey) : undefined)
+    return groupByGas(sortedData, groupOf).map(({ group, items }) => ({
+      label: group.label,
+      key: group.key,
+      tests: items,
+    }))
+  }, [sortedData, groupMode, suiteTests])
 
-    const groups = new Map<number, TestData[]>()
-    for (const test of sortedData) {
-      const group = getGasGroup(test.gasUsedTotal)
-      const existing = groups.get(group)
-      if (existing) {
-        existing.push(test)
-      } else {
-        groups.set(group, [test])
-      }
-    }
-
-    // Sort groups by gas amount descending
-    return [...groups.entries()]
-      .sort(([a], [b]) => b - a)
-      .map(([gasGroup, items]) => ({
-        label: formatGasGroup(gasGroup),
-        gasGroup,
-        tests: items,
-      }))
-  }, [sortedData, groupMode])
+  // Prev/next in the test modal follows the tiles as shown: the sort, the
+  // gas blocks, and the status and search filters.
+  const navOrder = useMemo(() => {
+    const shown = groupedData ? groupedData.flatMap((g) => g.tests) : sortedData
+    return shown
+      .filter((t) => !t.notProcessed && tileMatchesFilter(t, statusFilter, searchQuery))
+      .map((t) => t.testKey)
+  }, [groupedData, sortedData, statusFilter, searchQuery])
+  const selectTest = useCallback((testKey: string) => onSelectedTestChange?.(testKey), [onSelectedTestChange])
+  const navigation = useTestNavigation(navOrder, selectedTest, selectTest)
 
   // Distribution / above-threshold / below-threshold counts respect the
   // page-level status + search filter so the histogram reflects what the
@@ -694,8 +719,15 @@ export function TestHeatmap({
   // same multiples of their limit, so the chart keeps its shape: in
   // MGas/s mode the slow tests sit on the left, in Duration mode on the
   // right, because a long payload is a bad one.
+  // Tests with a value in the active colour mode. A rejected test has no
+  // MGas/s, but in Duration mode its time to reject counts.
+  const testsWithValue = useMemo(
+    () => filteredTestData.filter((t) => !t.noData || (colorMode === 'duration' && t.rejectedNs !== undefined)),
+    [filteredTestData, colorMode],
+  )
+
   const histogramData = useMemo(() => {
-    const testsWithData = filteredTestData.filter((t) => !t.noData)
+    const testsWithData = testsWithValue
     if (testsWithData.length === 0) return []
 
     // Create bins based on the limit: 0, 0.25x, 0.5x, 0.75x, 1x, 1.25x, 1.5x, 1.75x, 2x, 2.5x, 3x+
@@ -735,17 +767,16 @@ export function TestHeatmap({
           : getColorByThreshold(midpoint, threshold),
       }
     })
-  }, [filteredTestData, threshold, colorMode, slowMs])
+  }, [testsWithValue, threshold, colorMode, slowMs])
 
   // Slow / fast split for the counters next to the histogram, in the
   // unit of the active colour mode.
   const { slowCount, fastCount } = useMemo(() => {
-    const withData = filteredTestData.filter((t) => !t.noData)
     const slow = colorMode === 'duration'
-      ? withData.filter((t) => t.isSlow).length
-      : withData.filter((t) => t.mgasPerSec < threshold).length
-    return { slowCount: slow, fastCount: withData.length - slow }
-  }, [filteredTestData, colorMode, threshold])
+      ? testsWithValue.filter((t) => t.isSlow).length
+      : testsWithValue.filter((t) => t.mgasPerSec < threshold).length
+    return { slowCount: slow, fastCount: testsWithValue.length - slow }
+  }, [testsWithValue, colorMode, threshold])
 
   const handleMouseEnter = (test: TestData, event: React.MouseEvent) => {
     const rect = event.currentTarget.getBoundingClientRect()
@@ -819,7 +850,8 @@ export function TestHeatmap({
             onChange={handleGroupModeChange}
             options={[
               { value: 'none', label: 'None' },
-              { value: 'gas', label: 'Gas Used' },
+              { value: 'benchmark', label: 'Benchmark Gas', title: 'One block per benchmark gas value, from the test name' },
+              { value: 'gas', label: 'Gas Used', title: 'One block per gas the test really used, in 1M steps' },
             ]}
           />
         </div>
@@ -852,14 +884,15 @@ export function TestHeatmap({
       <div className="flex flex-col gap-1">
         <div className="text-xs/5 font-medium text-gray-500 dark:text-gray-400">
           Tests {SORT_CAPTIONS[sortMode]}
-          {groupMode !== 'none' && ' — grouped by gas used (30M steps)'}
+          {groupMode === 'benchmark' && ' — grouped by benchmark gas (from the test name)'}
+          {groupMode === 'gas' && ' — grouped by gas used (1M steps)'}
         </div>
         {groupedData ? (
           <div className="flex flex-col gap-2">
             {groupedData.map((group) => (
-              <div key={group.gasGroup} className="flex flex-col gap-0.5">
+              <div key={group.key} className="flex flex-col gap-0.5">
                 <div className="flex items-center gap-2">
-                  <span className="text-xs/5 font-medium text-gray-600 dark:text-gray-300">{group.label} gas</span>
+                  <span className="text-xs/5 font-medium text-gray-600 dark:text-gray-300">{group.label}</span>
                   <span className="text-xs/5 text-gray-400 dark:text-gray-500">({group.tests.length})</span>
                 </div>
                 <div className="flex flex-wrap gap-0.5">
@@ -980,6 +1013,13 @@ export function TestHeatmap({
           <span className="mr-1 inline-block size-3 rounded-xs" style={NO_DATA_STYLE} />
           No data
         </span>
+        <span title="The client rejected the expected-invalid payload. There is no MGas/s. In duration mode the tile keeps the colour of its time to reject, with a blue corner.">
+          <span
+            className="mr-1 inline-block size-3 rounded-xs"
+            style={isDurationMode ? { backgroundColor: THRESHOLD_COLORS[0], backgroundImage: REJECTED_OVERLAY_IMAGE } : REJECTED_TILE_STYLE}
+          />
+          Rejected (invalid payload)
+        </span>
         <span>
           <span className="mr-1 inline-block size-3 rounded-xs ring-1 ring-gray-300 dark:ring-gray-700" style={NOT_PROCESSED_STYLE} />
           Not processed
@@ -1016,10 +1056,15 @@ export function TestHeatmap({
               MGas/s:{' '}
               {tooltip.test.notProcessed
                 ? 'Not processed yet'
-                : tooltip.test.noData
-                  ? 'No data'
-                  : tooltip.test.mgasPerSec.toFixed(2)}
+                : tooltip.test.rejectedNs !== undefined
+                  ? 'n/a (payload rejected)'
+                  : tooltip.test.noData
+                    ? 'No data'
+                    : tooltip.test.mgasPerSec.toFixed(2)}
             </div>
+            {tooltip.test.rejectedNs !== undefined && (
+              <div>Time to reject: {formatDuration(tooltip.test.rejectedNs)}</div>
+            )}
             {!tooltip.test.noData && (
               <>
                 <div>Gas used: {(tooltip.test.gasUsedTotal / 1_000_000).toFixed(2)} MGas</div>
@@ -1041,6 +1086,8 @@ export function TestHeatmap({
             <TooltipFilename name={tooltip.test.filename} />
             {tooltip.test.notProcessed ? (
               <div className="text-gray-500 dark:text-gray-400">Test was not run</div>
+            ) : tooltip.test.rejectedNs !== undefined ? (
+              <div className="text-blue-600 dark:text-blue-400">The client rejected the invalid payload as expected</div>
             ) : tooltip.test.noData ? (
               <div className="text-gray-500 dark:text-gray-400">No gas usage data available</div>
             ) : null}
@@ -1063,6 +1110,7 @@ export function TestHeatmap({
             isOpen={!!selectedTest}
             onClose={() => onSelectedTestChange?.(undefined)}
             title={`Test #${executionOrder.get(selectedTest) ?? '?'}`}
+            headerActions={<TestNavControls navigation={navigation} />}
           >
             <div className="flex flex-col gap-6">
               <div className="flex flex-col gap-2">

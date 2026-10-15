@@ -1,17 +1,21 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from '@tanstack/react-router'
 import { GitCompareArrows, Medal, X } from 'lucide-react'
 import clsx from 'clsx'
 import type { RunResult, SuiteTest } from '@/api/types'
 import { type StepTypeOption, getAggregatedStats } from '@/pages/RunDetailPage'
 import { TestName } from '@/components/shared/TestName'
-import { EESTInfoContent, PayloadSizesContent, type OpcodeSortMode } from '@/components/suite-detail/TestFilesList'
+import { TestNavControls } from '@/components/shared/TestNavControls'
+import { useTestNavigation } from '@/hooks/useTestNavigation'
+import { Badge } from '@/components/shared/Badge'
+import { EESTInfoContent, InvalidPayloadNote, PayloadSizesContent, type OpcodeSortMode } from '@/components/suite-detail/TestFilesList'
 import { ExecutionsList } from '@/components/run-detail/ExecutionsList'
 import { type StepType } from '@/api/hooks/useTestDetails'
 import { formatTimestamp } from '@/utils/date'
 import { type GroupDef } from './groupUtils'
 import { MAX_COMPARE_RUNS, MEDAL_CLASSES, MEDAL_WATERMARK_SIZES, MIN_COMPARE_RUNS } from './constants'
 import { type HeatmapColorModel, type HeatmapMetric, heatmapColor } from './heatmapColor'
+import { isRejectedOnly, payloadTimeNs } from './compareMetrics'
 import { formatBytes, formatDuration } from '@/utils/format'
 import { SLOW_COLOR, THRESHOLD_COLORS, isSlowPayload } from '@/utils/perfThreshold'
 
@@ -20,6 +24,10 @@ interface TestDetailModalProps {
   testOrder?: number
   /** The suite entry of the test, for its EEST info and opcode counts. */
   suiteTest?: SuiteTest
+  /** Tests in the order the page shows them, for prev/next (arrow keys). */
+  navOrder?: string[]
+  /** Opens another test; with navOrder, enables prev/next. */
+  onSelectTest?: (testName: string) => void
   /** Suite the groups share. The step payloads come from its request files. */
   suiteHash?: string
   groups: GroupDef[]
@@ -78,6 +86,8 @@ interface RunPoint {
   gasUsed: number
   gasUsedTime: number
   duration: number
+  /** The run's payloads were all rejected: gasUsedTime is the time to reject. */
+  rejected: boolean
 }
 
 interface MetricSummary {
@@ -115,6 +125,8 @@ function summarize(values: number[], average: number | undefined, points: RunPoi
 export function TestDetailModal({
   testName,
   testOrder,
+  navOrder,
+  onSelectTest,
   suiteTest,
   suiteHash,
   groups,
@@ -165,6 +177,9 @@ export function TestDetailModal({
   // sections at once. The popover stays with the section under the mouse.
   const [hoveredRunId, setHoveredRunId] = useState<string | null>(null)
   const [runsGroupBy, setRunsGroupBy] = useState<RunsGroupBy>('none')
+  // Prev/next (and the arrow keys) through the tests as the page shows them.
+  const selectTest = useCallback((name: string) => onSelectTest?.(name), [onSelectTest])
+  const navigation = useTestNavigation(onSelectTest ? navOrder ?? [] : [], testName, selectTest)
   const [sortKey, setSortKey] = useState<SortKey>('run')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
 
@@ -195,7 +210,9 @@ export function TestDetailModal({
           timestamp: timestamps[ri],
           mgas,
           gasUsed: stats?.gas_used_total ?? 0,
-          gasUsedTime: stats?.gas_used_time_total ?? 0,
+          // The payload time; for a rejected test, the time to reject.
+          gasUsedTime: payloadTimeNs(stats) ?? 0,
+          rejected: isRejectedOnly(stats),
           duration: stats?.time_total ?? 0,
         }
       })
@@ -209,17 +226,21 @@ export function TestDetailModal({
       // plain mean is that same number.
       const measured = runs.filter((r) => r.mgas !== undefined)
       const totalGasTime = measured.reduce((sum, r) => sum + r.gasUsedTime, 0)
+      // A rejected test has no MGas/s, but its time to reject is a payload time.
+      const timed = runs.filter((r) => r.gasUsedTime > 0)
+      const totalTime = timed.reduce((sum, r) => sum + r.gasUsedTime, 0)
       const mgasAverage = totalGasTime > 0 ? (measured.reduce((sum, r) => sum + r.gasUsed, 0) * 1000) / totalGasTime : undefined
       const mgas = summarize(measured.map((r) => r.mgas as number), mgasAverage, measured)
-      const payloadTimes = measured.map((r) => r.gasUsedTime)
-      const duration = summarize(payloadTimes, measured.length > 0 ? totalGasTime / measured.length : undefined, measured)
+      const payloadTimes = timed.map((r) => r.gasUsedTime)
+      const duration = summarize(payloadTimes, timed.length > 0 ? totalTime / timed.length : undefined, timed)
 
       const metaStr = Object.entries(group.metadata).map(([k, v]) => `${k}=${v}`).join(', ')
       const label = metaStr || group.client
 
-      return { label, client: group.client, runs, metrics: { mgas, duration } }
+      return { label, client: group.client, runs, metrics: { mgas, duration }, rejected: runs.some((r) => r.rejected) }
     })
   }, [groups, groupResults, groupTimestamps, groupRunIds, stepFilter, testName])
+  const testRejected = groupData.some((g) => g.rejected)
 
 
   return (
@@ -238,9 +259,12 @@ export function TestDetailModal({
               <TestName name={testName} showRawBelow showCopy onChipClick={onChipFilterToggle} activeQuery={searchQuery} />
             </div>
           </div>
-          <button onClick={onClose} className="shrink-0 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300">
-            <X className="size-5" />
-          </button>
+          <div className="flex shrink-0 items-center gap-3">
+            <TestNavControls navigation={navigation} />
+            <button onClick={onClose} className="shrink-0 text-gray-400 hover:text-gray-600 dark:text-gray-500 dark:hover:text-gray-300">
+              <X className="size-5" />
+            </button>
+          </div>
         </div>
 
         {/* Body */}
@@ -249,9 +273,11 @@ export function TestDetailModal({
             {suiteTest && (
               <EESTInfoContent test={suiteTest} opcodeSort={opcodeSort} onOpcodeSortChange={setOpcodeSort} />
             )}
-            <GroupCards groupData={groupData} mgasValues={groupMgas} durationValues={groupDurations} baselineGroupIdx={baselineGroupIdx} heatmapModel={heatmapModel} />
+            {/* Older suites carry no expected_rejections; the results still show the rejection. */}
+            {testRejected && !suiteTest?.eest?.expected_rejections?.length && <InvalidPayloadNote />}
+            <GroupCards groupData={groupData} mgasValues={groupMgas} durationValues={groupDurations} baselineGroupIdx={baselineGroupIdx} heatmapModel={heatmapModel} rejected={testRejected} />
             <MetricSection metric="mgas" title="MGas/s" testName={testName} groupData={groupData} heatmapModel={heatmapModel} open={expanded.has('mgas')} onToggleOpen={() => toggleExpanded('mgas')} hoveredRunId={hoveredRunId} onHoverRunChange={setHoveredRunId} />
-            <MetricSection metric="duration" title="Payload time" testName={testName} groupData={groupData} heatmapModel={heatmapModel} open={expanded.has('duration')} onToggleOpen={() => toggleExpanded('duration')} hoveredRunId={hoveredRunId} onHoverRunChange={setHoveredRunId} />
+            <MetricSection metric="duration" title={testRejected ? 'Time to reject' : 'Payload time'} testName={testName} groupData={groupData} heatmapModel={heatmapModel} open={expanded.has('duration')} onToggleOpen={() => toggleExpanded('duration')} hoveredRunId={hoveredRunId} onHoverRunChange={setHoveredRunId} />
 
             <RunsTable
               groupData={groupData}
@@ -518,7 +544,13 @@ function RunsTable({ groupData, testName, open, onToggleOpen, groupBy, onGroupBy
                     <td className="px-2 py-1"><GroupLabel group={group} gi={gi} /></td>
                   )}
                   <td className="px-2 py-1">{run.timestamp ? formatTimestamp(run.timestamp) : `Run ${ri + 1}`}</td>
-                  <td className="px-2 py-1 text-right font-mono">{run.mgas !== undefined ? run.mgas.toFixed(2) : '-'}</td>
+                  <td className="px-2 py-1 text-right font-mono">
+                    {run.mgas !== undefined
+                      ? run.mgas.toFixed(2)
+                      : run.rejected
+                        ? <Badge variant="info" className="font-sans">REJECTED</Badge>
+                        : '-'}
+                  </td>
                   <td className="px-2 py-1 text-right font-mono">{run.gasUsed > 0 ? `${(run.gasUsed / 1_000_000).toFixed(1)}M` : '-'}</td>
                   <td className="px-2 py-1 text-right font-mono">{run.gasUsedTime > 0 ? formatDuration(run.gasUsedTime) : '-'}</td>
                   <td className="px-2 py-1 text-right font-mono" title="Wall time of the whole test step, payloads and other calls">
@@ -565,6 +597,8 @@ interface GroupSummary {
   /** Every sampled run of the group, in run order. */
   runs: RunPoint[]
   metrics: Record<HeatmapMetric, MetricSummary>
+  /** The group's runs rejected the test's payloads (an invalid-payload benchmark). */
+  rejected: boolean
 }
 
 /**
@@ -573,8 +607,13 @@ interface GroupSummary {
  * by leads, the other follows. The tint, the note and the slow marker
  * match the heatmap tile of the test.
  */
-function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, heatmapModel }: {
+function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, heatmapModel, rejected }: {
   groupData: GroupSummary[]
+  /**
+   * The test is an invalid-payload benchmark: it has no MGas/s, so the cards
+   * rank and compare the time to reject.
+   */
+  rejected: boolean
   /** Averaged MGas/s per group — the value the heatmap tile shows. */
   mgasValues: (number | undefined)[]
   /** Averaged payload time per group, in nanoseconds. */
@@ -582,7 +621,8 @@ function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, h
   baselineGroupIdx: number
   heatmapModel: HeatmapColorModel
 }) {
-  const { metric, mode, slowMs } = heatmapModel
+  const { mode, slowMs } = heatmapModel
+  const metric: HeatmapMetric = rejected ? 'duration' : heatmapModel.metric
   const values = metric === 'mgas' ? mgasValues : durationValues
 
   // The slowest group of the comparison. Every other card says how much
@@ -593,10 +633,12 @@ function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, h
     : undefined
 
   // The gas of a test is the same for every group, so the MGas/s order is
-  // the payload time order turned around. One ranking serves both.
+  // the payload time order turned around. One ranking serves both. A
+  // rejected test has no MGas/s: the shortest time to reject ranks first.
+  const rankValues = rejected ? durationValues.map((v) => (v === undefined ? undefined : -v)) : mgasValues
   const order = groupData.map((_, gi) => gi).sort((a, b) => {
-    const va = mgasValues[a]
-    const vb = mgasValues[b]
+    const va = rankValues[a]
+    const vb = rankValues[b]
     if (va === undefined || vb === undefined) return Number(va === undefined) - Number(vb === undefined)
     return vb - va
   })
@@ -611,9 +653,10 @@ function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, h
         const duration = durationValues[gi]
         const value = values[gi]
         // Gold, silver and bronze for the fastest three, as in the ranking.
-        const medal = groupData.length >= 2 && mgas !== undefined && place < MEDAL_CLASSES.length ? place : undefined
+        const medal = groupData.length >= 2 && rankValues[gi] !== undefined && place < MEDAL_CLASSES.length ? place : undefined
         const base = baselineGroupIdx >= 0 ? values[baselineGroupIdx] : undefined
-        const color = heatmapColor(value, base, heatmapModel)
+        // Colour by the metric the card leads with (the time for a rejected test).
+        const color = heatmapColor(value, base, { ...heatmapModel, metric })
         const isBaseline = mode === 'baseline' && gi === baselineGroupIdx && groupData.length >= 2
         const slow = duration !== undefined && isSlowPayload(duration, slowMs)
         const gain = slowest !== undefined && value !== undefined && slowest > 0 && value > 0
@@ -628,10 +671,13 @@ function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, h
               : `+${(gain * 100).toFixed(gain >= 0.1 ? 0 : 1)}% vs slowest`
         const lead = metric === 'mgas'
           ? { value: mgas === undefined ? '—' : mgas.toFixed(2), unit: 'MGas/s' }
+          // For a rejected test the REJECTED badge below says what the time is.
           : { value: duration === undefined ? '—' : formatDuration(duration), unit: '' }
-        const follow = metric === 'mgas'
-          ? `${duration === undefined ? '—' : formatDuration(duration)} payload time`
-          : `${mgas === undefined ? '—' : mgas.toFixed(2)} MGas/s`
+        const follow = rejected
+          ? null
+          : metric === 'mgas'
+            ? `${duration === undefined ? '—' : formatDuration(duration)} payload time`
+            : `${mgas === undefined ? '—' : mgas.toFixed(2)} MGas/s`
         return (
           <div
             key={gi}
@@ -664,7 +710,13 @@ function GroupCards({ groupData, mgasValues, durationValues, baselineGroupIdx, h
               {lead.value}
               {lead.unit && <span className="ml-1 text-xs/5 font-normal text-gray-500 dark:text-gray-400">{lead.unit}</span>}
             </span>
-            <span className="font-mono text-xs/5 text-gray-600 dark:text-gray-300">{follow}</span>
+            {follow !== null ? (
+              <span className="font-mono text-xs/5 text-gray-600 dark:text-gray-300">{follow}</span>
+            ) : (
+              <span title="The client rejected this invalid payload as expected. A rejected payload has no MGas/s.">
+                <Badge variant="info">REJECTED</Badge>
+              </span>
+            )}
             {note && (
               <span
                 className="text-xs/5 text-gray-500 dark:text-gray-400"

@@ -12,6 +12,8 @@ import {
   MAX_THRESHOLD,
   MIN_SLOW_MS,
   MIN_THRESHOLD,
+  REJECTED_OVERLAY_IMAGE,
+  REJECTED_TILE_STYLE,
   SLOW_COLOR,
   SLOW_STEP_MS,
   THRESHOLD_COLORS,
@@ -26,12 +28,16 @@ import { formatDuration } from '@/utils/format'
 import { positionTooltip } from '@/utils/tooltipPosition'
 import { type CompareRun, type LabelMode, RUN_SLOTS, formatRunLabel } from './constants'
 import { type HeatmapColorModel, baselineRatio, formatRatio, heatmapColor } from './heatmapColor'
+import { fixtureGasByTest, isRejectedOnly, payloadTimeNs } from './compareMetrics'
+import { type HeatmapGroupMode, benchmarkGasGroup, gasUsedGroup, groupByGas } from '@/utils/gasGroup'
 
 // One row per group, one column per test. When the tests do not fit the
 // width, the matrix wraps into stanzas: each stanza repeats the group
 // rows for its slice of tests, so a column is the same test in every row.
 
 export type SortMode = 'order' | 'spread' | 'avg'
+/** Tests in one matrix, or one matrix per gas value (see HeatmapGroupMode). */
+export type GroupMode = HeatmapGroupMode
 
 // Same tile as the run-detail heatmap. The logo is the tile size too,
 // so it does not set a taller row pitch than the tiles.
@@ -52,8 +58,18 @@ interface HeatmapTest {
   order: number
   /** MGas/s per group, in `runs` order. */
   mgas: (number | undefined)[]
-  /** Total engine_newPayload time per group in nanoseconds, in `runs` order. */
+  /**
+   * Total engine_newPayload time per group in nanoseconds, in `runs` order.
+   * For a rejected test it is the time the client took to reject the payloads.
+   */
   durations: (number | undefined)[]
+  /** Whether the group's payloads for this test are all ones it must reject (no MGas/s). */
+  rejected: boolean[]
+  /**
+   * Gas the test really used, from the first group that reports it. A
+   * rejected test reports none; its fixture records the gas instead.
+   */
+  gasUsed?: number
   /** Whether the group reported failed executions for this test. */
   fails: boolean[]
   /** Positions in `runs` with the highest MGas/s, when at least two groups have a value. Same rule as the ranking. */
@@ -89,6 +105,11 @@ interface GroupHeatmapProps {
   /** Test order of the matrix. The page owns it so the URL keeps it. */
   sortMode: SortMode
   onSortModeChange: (mode: SortMode) => void
+  /** Whether the matrix splits into one block per benchmark gas value. The page owns it so the URL keeps it. */
+  groupMode?: GroupMode
+  onGroupModeChange?: (mode: GroupMode) => void
+  /** Reports the tests in display order (sort and gas blocks), for prev/next in the test modal. */
+  onDisplayOrderChange?: (testNames: string[]) => void
 }
 
 function calculateMGasPerSec(stats: AggregatedStats | undefined): number | undefined {
@@ -204,6 +225,9 @@ export function GroupHeatmap({
   onHighlightChange,
   sortMode,
   onSortModeChange,
+  groupMode = 'none',
+  onGroupModeChange,
+  onDisplayOrderChange,
 }: GroupHeatmapProps) {
   const { metric, mode, threshold, slowMs } = model
   // The sliders fire on every tick and each tick recolours every tile.
@@ -244,6 +268,7 @@ export function GroupHeatmap({
             order: suiteOrder.get(name) ?? (parseInt(entry.dir, 10) || 0),
             mgas: new Array<number | undefined>(runs.length).fill(undefined),
             durations: new Array<number | undefined>(runs.length).fill(undefined),
+            rejected: new Array<boolean>(runs.length).fill(false),
             fails: new Array<boolean>(runs.length).fill(false),
             winners: new Set(),
             spread: 0,
@@ -253,12 +278,18 @@ export function GroupHeatmap({
         }
         const stats = getAggregatedStats(entry, stepFilter)
         test.mgas[gi] = calculateMGasPerSec(stats)
-        test.durations[gi] = stats && stats.gas_used_time_total > 0 ? stats.gas_used_time_total : undefined
+        test.durations[gi] = payloadTimeNs(stats)
+        test.rejected[gi] = isRejectedOnly(stats)
+        if (test.gasUsed === undefined && stats && stats.gas_used_total > 0) test.gasUsed = stats.gas_used_total
         test.fails[gi] = (stats?.fail ?? 0) > 0
       }
     })
 
     const list = [...byName.values()]
+    const fixtureGas = fixtureGasByTest(suiteTests)
+    for (const test of list) {
+      if (test.gasUsed === undefined && test.rejected.some(Boolean)) test.gasUsed = fixtureGas.get(test.name)
+    }
     for (const test of list) {
       const known = (metric === 'mgas' ? test.mgas : test.durations).filter((v): v is number => v !== undefined)
       if (known.length >= 2) test.spread = Math.max(...known) / Math.min(...known) - 1
@@ -269,6 +300,13 @@ export function GroupHeatmap({
         const best = Math.max(...knownMgas)
         test.mgas.forEach((v, gi) => {
           if (v === best) test.winners.add(gi)
+        })
+      } else if (test.rejected.filter(Boolean).length >= 2) {
+        // A rejected test has no MGas/s: the fastest rejection wins.
+        const times = test.durations.filter((v, gi): v is number => v !== undefined && test.rejected[gi])
+        const best = Math.min(...times)
+        test.durations.forEach((v, gi) => {
+          if (test.rejected[gi] && v === best) test.winners.add(gi)
         })
       }
     }
@@ -316,11 +354,39 @@ export function GroupHeatmap({
     [tests, slowMs],
   )
 
-  const stanzas = useMemo(() => {
-    const out: HeatmapTest[][] = []
-    for (let i = 0; i < tests.length; i += perRow) out.push(tests.slice(i, i + perRow))
-    return out
-  }, [tests, perRow])
+  // The matrix blocks: one with every test, or one per gas value (most gas
+  // first, as on the run page). Each block keeps the sort order and wraps
+  // into stanzas of its own.
+  const blocks = useMemo(() => {
+    const chunk = (list: HeatmapTest[]) => {
+      const out: HeatmapTest[][] = []
+      for (let i = 0; i < list.length; i += perRow) out.push(list.slice(i, i + perRow))
+      return out
+    }
+    if (groupMode === 'none') return [{ key: 'all', label: undefined, count: tests.length, stanzas: chunk(tests) }]
+    const groupOf = groupMode === 'benchmark'
+      ? (t: HeatmapTest) => benchmarkGasGroup(t.name)
+      : (t: HeatmapTest) => gasUsedGroup(t.gasUsed)
+    return groupByGas(tests, groupOf).map(({ group, items }) => ({
+      key: group.key,
+      label: group.label,
+      count: items.length,
+      stanzas: chunk(items),
+    }))
+  }, [tests, perRow, groupMode])
+
+  // The tests in display order, independent of the width: the sort, then
+  // the gas blocks.
+  const displayOrder = useMemo(() => {
+    if (groupMode === 'none') return tests.map((t) => t.name)
+    const groupOf = groupMode === 'benchmark'
+      ? (t: HeatmapTest) => benchmarkGasGroup(t.name)
+      : (t: HeatmapTest) => gasUsedGroup(t.gasUsed)
+    return groupByGas(tests, groupOf).flatMap(({ items }) => items.map((t) => t.name))
+  }, [tests, groupMode])
+  useEffect(() => {
+    onDisplayOrderChange?.(displayOrder)
+  }, [displayOrder, onDisplayOrderChange])
 
   // The highlighted group's position in `runs`, or -1 when none or when
   // the group has no result.
@@ -335,7 +401,11 @@ export function GroupHeatmap({
   const tileStyle = (test: HeatmapTest, gi: number): React.CSSProperties => {
     const values = valuesOf(test, deferredModel.metric)
     const color = heatmapColor(values[gi], values[baselineIdx], deferredModel)
-    const style: React.CSSProperties = color ? { backgroundColor: color } : { ...NO_DATA_STYLE }
+    // A rejected tile with a colour (its time to reject, in duration mode)
+    // keeps the colour under the blue stripes of the rejected legend.
+    const style: React.CSSProperties = color
+      ? { backgroundColor: color, ...(test.rejected[gi] ? { backgroundImage: REJECTED_OVERLAY_IMAGE } : {}) }
+      : test.rejected[gi] ? { ...REJECTED_TILE_STYLE } : { ...NO_DATA_STYLE }
     // With a highlighted group, every column it does not win dims, the
     // same treatment as a filtered-out tile on the run page.
     if (highlightPos >= 0 && !test.winners.has(highlightPos)) style.opacity = 0.15
@@ -434,6 +504,18 @@ export function GroupHeatmap({
             },
           ]}
         />
+        {onGroupModeChange && (
+          <ModeGroup
+            label="Group by:"
+            value={groupMode}
+            onChange={onGroupModeChange}
+            options={[
+              { value: 'none', label: 'None' },
+              { value: 'benchmark', label: 'Benchmark Gas', title: 'One block per benchmark gas value, from the test name' },
+              { value: 'gas', label: 'Gas Used', title: 'One block per gas the test really used, in 1M steps' },
+            ]}
+          />
+        )}
         {mode === 'baseline' && runs.length >= 2 && (
           <div className="flex items-center gap-2 text-xs/5 text-gray-500 dark:text-gray-400">
             <span>Baseline:</span>
@@ -479,34 +561,46 @@ export function GroupHeatmap({
 
       {/* Grid */}
       <div ref={gridRef} className="flex flex-col gap-3">
-        {stanzas.map((stanza, si) => (
-          // No vertical gap: the tiles of one test stack into one bar, so a
-          // column reads as one test across the groups.
-          <div key={si} className="flex flex-col">
-            {runs.map((run, gi) => (
-              <div key={run.index} className="flex items-center" style={{ gap: GAP_PX }}>
-                <img
-                  src={`/img/clients/${run.config.instance.client}.jpg`}
-                  alt={run.config.instance.client}
-                  title={formatRunLabel(RUN_SLOTS[run.index], run, labelMode)}
-                  className="shrink-0 rounded-full object-cover"
-                  style={{ width: TILE_PX, height: TILE_PX, marginRight: LABEL_PX - TILE_PX - GAP_PX }}
-                />
-                {stanza.map((test) => (
-                  <button
-                    key={test.name}
-                    onClick={() => onTestClick?.(test.name)}
-                    onMouseEnter={(e) => setTooltip({ test, anchor: e.currentTarget.getBoundingClientRect() })}
-                    onMouseLeave={() => setTooltip(null)}
-                    className={clsx(
-                      'relative shrink-0 cursor-pointer transition-transform hover:z-10 hover:scale-150 hover:ring-2 hover:ring-gray-500 dark:hover:ring-gray-300',
-                      test.fails[gi] && 'ring-1 ring-inset ring-red-500',
-                    )}
-                    style={{ width: TILE_PX, height: TILE_PX, ...tileStyle(test, gi) }}
-                  />
-                ))}
+        {blocks.map((block) => (
+          <div key={block.key} className="flex flex-col gap-1">
+            {block.label && (
+              <div className="flex items-center gap-2">
+                <span className="text-xs/5 font-medium text-gray-600 dark:text-gray-300">{block.label}</span>
+                <span className="text-xs/5 text-gray-400 dark:text-gray-500">({block.count})</span>
               </div>
-            ))}
+            )}
+            <div className="flex flex-col gap-3">
+              {block.stanzas.map((stanza, si) => (
+                // No vertical gap: the tiles of one test stack into one bar, so a
+                // column reads as one test across the groups.
+                <div key={si} className="flex flex-col">
+                  {runs.map((run, gi) => (
+                    <div key={run.index} className="flex items-center" style={{ gap: GAP_PX }}>
+                      <img
+                        src={`/img/clients/${run.config.instance.client}.jpg`}
+                        alt={run.config.instance.client}
+                        title={formatRunLabel(RUN_SLOTS[run.index], run, labelMode)}
+                        className="shrink-0 rounded-full object-cover"
+                        style={{ width: TILE_PX, height: TILE_PX, marginRight: LABEL_PX - TILE_PX - GAP_PX }}
+                      />
+                      {stanza.map((test) => (
+                        <button
+                          key={test.name}
+                          onClick={() => onTestClick?.(test.name)}
+                          onMouseEnter={(e) => setTooltip({ test, anchor: e.currentTarget.getBoundingClientRect() })}
+                          onMouseLeave={() => setTooltip(null)}
+                          className={clsx(
+                            'relative shrink-0 cursor-pointer transition-transform hover:z-10 hover:scale-150 hover:ring-2 hover:ring-gray-500 dark:hover:ring-gray-300',
+                            test.fails[gi] && 'ring-1 ring-inset ring-red-500',
+                          )}
+                          style={{ width: TILE_PX, height: TILE_PX, ...tileStyle(test, gi) }}
+                        />
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              ))}
+            </div>
           </div>
         ))}
       </div>
@@ -540,6 +634,18 @@ export function GroupHeatmap({
           <span className="mr-1 inline-block size-3 rounded-xs ring-1 ring-inset ring-red-500" style={{ backgroundColor: THRESHOLD_COLORS[THRESHOLD_LIMIT_STEP] }} />
           Failed executions
         </span>
+        {tests.some((t) => t.rejected.some(Boolean)) && (
+          <span
+            className="flex items-center"
+            title="The client rejected the invalid payload as expected. It has no MGas/s. In the Duration mode the tile keeps the colour of its time to reject, with a blue corner."
+          >
+            <span
+              className="mr-1 inline-block size-3 rounded-xs"
+              style={metric === 'duration' ? { backgroundColor: THRESHOLD_COLORS[0], backgroundImage: REJECTED_OVERLAY_IMAGE } : REJECTED_TILE_STYLE}
+            />
+            Rejected (invalid payload)
+          </span>
+        )}
         <span className="flex items-center" title={`Payload time above ${formatSlowMs(slowMs)}`}>
           <span
             className="mr-1 inline-block size-3 rounded-xs"
@@ -575,9 +681,14 @@ export function GroupHeatmap({
                           {formatRunLabel(slot, run, labelMode)}
                         </span>
                       </td>
-                      <td className="pr-2 text-right font-mono">{value === undefined ? '—' : formatValue(value)}</td>
+                      <td className="pr-2 text-right font-mono">
+                        {value !== undefined
+                          ? formatValue(value)
+                          : tooltip.test.rejected[gi] ? <span className="text-blue-600 dark:text-blue-400">rejected</span> : '—'}
+                      </td>
                       <td className="pr-2 text-right font-mono text-gray-400 dark:text-gray-500">
                         {other !== undefined && (metric === 'mgas' ? formatDuration(other) : `${other.toFixed(1)} MGas/s`)}
+                        {metric === 'duration' && tooltip.test.rejected[gi] && 'to reject'}
                       </td>
                       <td className="text-right font-mono text-gray-500 dark:text-gray-400">
                         {value !== undefined && base !== undefined && gi !== baselineIdx && formatRatio(baselineRatio(value, base, metric))}

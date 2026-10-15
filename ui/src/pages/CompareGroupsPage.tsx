@@ -14,9 +14,9 @@ import { CompareDimensionInsights } from '@/components/compare/CompareDimensionI
 import { type StepTypeOption, ALL_STEP_TYPES, DEFAULT_STEP_FILTER, getAggregatedStats } from '@/pages/RunDetailPage'
 import { type CompareRun, type ChartType, CHART_TYPE_OPTIONS } from '@/components/compare/constants'
 import { TestMetricChart } from '@/components/compare/TestMetricChart'
-import { type SortMode, GroupHeatmap } from '@/components/compare/GroupHeatmap'
+import { type GroupMode, type SortMode, GroupHeatmap } from '@/components/compare/GroupHeatmap'
 import { GroupRanking } from '@/components/compare/GroupRanking'
-import { computeMetrics } from '@/components/compare/compareMetrics'
+import { computeMetrics, fixtureGasByTest, payloadTimeNs, testGasForFilter } from '@/components/compare/compareMetrics'
 import { type HeatmapColorModel } from '@/components/compare/heatmapColor'
 import { DEFAULT_SLOW_MS, DEFAULT_THRESHOLD, MAX_SLOW_MS, MAX_THRESHOLD, MIN_SLOW_MS, MIN_THRESHOLD } from '@/utils/perfThreshold'
 import { CVComparisonChart } from '@/components/compare/CVComparisonChart'
@@ -27,6 +27,7 @@ import { GroupBuilder } from '@/components/compare/GroupBuilder'
 import { type GroupDef, parseGroupsParam, encodeGroupsParam, selectGroupRuns } from '@/components/compare/groupUtils'
 import { averageResults } from '@/utils/averageResults'
 import { TestDetailModal } from '@/components/compare/TestDetailModal'
+import { parseHeatmapGroupMode } from '@/utils/gasGroup'
 
 function parseStepFilter(param: string | undefined): StepTypeOption[] {
   if (!param) return DEFAULT_STEP_FILTER
@@ -56,6 +57,7 @@ export function CompareGroupsPage() {
     heatmapThreshold?: string
     heatmapSlowMs?: string
     heatmapSort?: string
+    heatmapGroup?: string
     testModal?: string
     testExpand?: string
   }
@@ -93,6 +95,7 @@ export function CompareGroupsPage() {
           heatmapThreshold: search.heatmapThreshold,
           heatmapSlowMs: search.heatmapSlowMs,
           heatmapSort: search.heatmapSort,
+          heatmapGroup: search.heatmapGroup,
           testModal: search.testModal,
           testExpand: search.testExpand,
           ...patch,
@@ -365,6 +368,22 @@ export function CompareGroupsPage() {
     (mode: SortMode) => updateSearch({ heatmapSort: mode === 'order' ? undefined : mode }),
     [updateSearch],
   )
+  // Heatmap blocks: 'none' is the default, so it stays out of the URL.
+  const heatmapGroup: GroupMode = parseHeatmapGroupMode(search.heatmapGroup)
+  const setHeatmapGroup = useCallback(
+    (mode: GroupMode) => updateSearch({ heatmapGroup: mode === 'none' ? undefined : mode }),
+    [updateSearch],
+  )
+  // Tests in the heatmap's display order, for prev/next in the test modal.
+  // A new array with the same tests keeps the old one: the heatmap reports
+  // its order after every render, and a fresh array would render the page
+  // (and the heatmap) again, without end.
+  const [heatmapOrder, setHeatmapOrder] = useState<string[]>([])
+  const handleHeatmapOrder = useCallback((names: string[]) => {
+    setHeatmapOrder((prev) =>
+      prev.length === names.length && prev.every((name, i) => name === names[i]) ? prev : names,
+    )
+  }, [])
   const [sharedZoom, setSharedZoom] = useState(true)
   const [chartZoom, setChartZoom] = useState({ start: 0, end: 100 })
   const tableSortBy = (search.sort ?? 'order') as 'order' | 'name' | 'gasUsed' | 'avgValue' | `run-${number}`
@@ -387,12 +406,13 @@ export function CompareGroupsPage() {
     const map = new Map<string, number>()
     const result = syntheticRuns.find((r) => r.result)?.result
     if (!result) return map
+    const fixtureGas = fixtureGasByTest(suite?.tests)
     for (const [name, entry] of Object.entries(result.tests)) {
       const step = entry.steps?.test
-      if (step) map.set(name, step.aggregated.gas_used_total)
+      if (step) map.set(name, testGasForFilter(step.aggregated, fixtureGas.get(name)))
     }
     return map
-  }, [syntheticRuns])
+  }, [syntheticRuns, suite?.tests])
 
   const availableGasBuckets = useMemo(() => {
     const buckets = new Set<number>()
@@ -499,9 +519,10 @@ export function CompareGroupsPage() {
     for (const run of syntheticRuns) {
       const entry = run.result?.tests[selectedTest]
       const stats = entry ? getAggregatedStats(entry, stepFilter) : undefined
+      // A rejected test has a time to reject but no MGas/s.
+      durations[run.index] = payloadTimeNs(stats)
       if (!stats || stats.gas_used_time_total <= 0) continue
       mgas[run.index] = (stats.gas_used_total * 1000) / stats.gas_used_time_total
-      durations[run.index] = stats.gas_used_time_total
     }
     return { mgas, durations }
   }, [selectedTest, groups.length, syntheticRuns, stepFilter])
@@ -825,6 +846,9 @@ export function CompareGroupsPage() {
             onModelChange={updateHeatmapModel}
             sortMode={heatmapSort}
             onSortModeChange={setHeatmapSort}
+            groupMode={heatmapGroup}
+            onGroupModeChange={setHeatmapGroup}
+            onDisplayOrderChange={handleHeatmapOrder}
             testNameFilter={testNameFilter}
             onTestClick={setSelectedTest}
             highlightGroupIdx={highlightGroupIdx}
@@ -936,6 +960,8 @@ export function CompareGroupsPage() {
       {selectedTest && hasResults && (
         <TestDetailModal
           testName={selectedTest}
+          navOrder={heatmapOrder}
+          onSelectTest={setSelectedTest}
           testOrder={(() => {
             const idx = suite?.tests?.findIndex((t) => t.name === selectedTest) ?? -1
             return idx >= 0 ? idx + 1 : undefined
