@@ -177,7 +177,8 @@ jobs:
                 images:
                   nethermind: ghcr.io/ethereum/state-actor-nethermind:main
                   besu: ghcr.io/ethereum/state-actor-besu:main
-                  nimbus: ghcr.io/ethereum/state-actor-nimbus:main
+                  # Built from ethereum/state-actor#142; use :main once it merges.
+                  nimbus: ghcr.io/ethereum/state-actor-nimbus:pr-142-2d034a7
                 pull_policy: always
                 config:
                   seed: 1234
@@ -334,7 +335,8 @@ jobs:
                   besu: ghcr.io/ethereum/state-actor-besu:main
                   geth: ghcr.io/ethereum/state-actor:main
                   erigon: ghcr.io/ethereum/state-actor-erigon:main
-                  nimbus: ghcr.io/ethereum/state-actor-nimbus:main
+                  # Built from ethereum/state-actor#142; use :main once it merges.
+                  nimbus: ghcr.io/ethereum/state-actor-nimbus:pr-142-2d034a7
                 pull_policy: always
                 config:
                   seed: 1234
